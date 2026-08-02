@@ -272,7 +272,7 @@ try{
   let drawing = false;
   let activePointerId = null; // the pointerId currently owning the in-progress stroke
   let hoverX = null, hoverY = null; // last known pointer position (wrap-relative), for the brush preview
-  let hoverPressure = 1; // last known hover pressure (pen: 0 when not touching), for the brush preview
+  let hoverPointerType = 'mouse';
   let hovering = false;
   let chaseRAF = null;
   const undoStack = [];
@@ -338,20 +338,6 @@ try{
     return e.pressure || 1;
   }
 
-  // Pressure to use for the hover PREVIEW specifically. This is deliberately
-  // different from getPressure() above: while actually drawing, a pen
-  // reporting 0 pressure basically can't happen (it means tip contact with
-  // zero force, vs. "not touching yet"), so getPressure() safely falls back
-  // to 1. But while hovering — tip above the digitizer, not touching — pens
-  // genuinely report pressure 0, and that's exactly the case we want the
-  // preview to show: a mouse always previews at full size (it has no
-  // pressure concept), but a hovering pen should preview small/near-zero
-  // and grow as it's pressed down, giving a real look-ahead of what the
-  // next dab's size will actually be.
-  function getHoverPressure(e){
-    if(e.pointerType === 'pen' && typeof e.pressure === 'number') return e.pressure;
-    return 1;
-  }
   // Pressure -> visual weight, ported from the reference app's approach.
   //
   // A plain linear map (radius = floor + (full-floor)*pressure) turns out to
@@ -1025,7 +1011,7 @@ try{
     const wrapRect = stageWrap.getBoundingClientRect();
     hoverX = e.clientX - wrapRect.left;
     hoverY = e.clientY - wrapRect.top;
-    hoverPressure = getHoverPressure(e);
+    hoverPointerType = e.pointerType;
     hovering = true;
     if(isSizeDragging){ doSizeDrag(e); return; }
     if(isZoomDragging){ doZoomDrag(e); updateBrushPreview(); return; }
@@ -1036,7 +1022,7 @@ try{
 
   stageWrap.addEventListener('pointerenter', (e)=>{
     hovering = true;
-    hoverPressure = getHoverPressure(e);
+    hoverPointerType = e.pointerType;
     updateBrushPreview();
   });
   stageWrap.addEventListener('pointerleave', ()=>{
@@ -1162,16 +1148,13 @@ try{
     return { x: (bx / SS) * zoom + panX, y: (by / SS) * zoom + panY };
   }
 
-  function showSizePreview(anchorX, anchorY, size, pressure){
-    // Unlike an actual stroke (which should legitimately fade to near-nothing
-    // at true zero pressure — you're not touching yet), the preview exists
-    // purely as a look-ahead gauge and needs to stay visible even while a
-    // pen is hovering with ~0 pressure. Floor the pressure INPUT here (not
-    // the resulting alpha/radius) so it still runs through the same curve
-    // and still visibly grows as real pressure increases — it just never
-    // starts from a value low enough to vanish.
+  function showSizePreview(anchorX, anchorY, size, pressure, fixedDiameter){
     const PREVIEW_MIN_PRESSURE = 0.3;
-    pressure = pressure == null ? 1 : Math.max(PREVIEW_MIN_PRESSURE, pressure);
+    pressure = pressure == null
+      ? 1
+      : fixedDiameter == null
+        ? Math.max(PREVIEW_MIN_PRESSURE, pressure)
+        : Math.max(0, Math.min(1, pressure));
     // Render the preview at the SAME fixed backing-store density the real
     // canvas uses (size * SS, independent of zoom/DPR), then let CSS scale
     // it up by `zoom` — exactly how the real canvas is displayed. Using a
@@ -1192,16 +1175,14 @@ try{
     // and keeping the circle's sub-pixel offset within that box makes the
     // preview's antialiasing genuinely track the canvas as you move.
     //
-    // The box itself always stays sized for the FULL brush (unscaled
-    // `size`) so it doesn't constantly resize frame to frame; only the
-    // drawn circle's radius is scaled by pressure. A mouse has no pressure
-    // concept and always previews at full size; a hovering pen reports
-    // near-zero pressure until it touches down, so its preview starts tiny
-    // and grows into the full dab as it's pressed — a real look-ahead of
-    // the next stamp's actual size.
+    // The box stays sized for the full brush so its texel-grid phase remains
+    // stable. The optional fixed diameter lets pen hover display a 1px
+    // light-pressure dab without scaling up with the brush's maximum size.
     const margin = 4; // backing-store px of headroom for the AA edge
     const backingSize = Math.max(1, Math.round(size * SS)) + margin * 2;
-    const rBacking = pressureRadius(size, pressure);
+    const rBacking = fixedDiameter == null
+      ? pressureRadius(size, pressure)
+      : Math.max(MIN_ABS_RADIUS_BACKING, fixedDiameter * SS / 2);
 
     const cursorCanvas = wrapToCanvas(anchorX, anchorY);
     const originBX = Math.floor(cursorCanvas.x - backingSize / 2);
@@ -1267,7 +1248,14 @@ try{
       return;
     }
     if(!hovering || hoverX === null) { hideSizePreview(); return; }
-    showSizePreview(hoverX, hoverY, getBrushSize(), hoverPressure);
+    if(hoverPointerType === 'pen'){
+      // Match the brush engine's absolute lightest-pressure floor: a tiny
+      // subpixel mark, independent of the selected maximum brush size.
+      const lightestDiameter = 2 * MIN_ABS_RADIUS_BACKING / SS;
+      showSizePreview(hoverX, hoverY, getBrushSize(), 0, lightestDiameter);
+    } else {
+      showSizePreview(hoverX, hoverY, getBrushSize());
+    }
   }
 
   function isTypingTarget(el){
