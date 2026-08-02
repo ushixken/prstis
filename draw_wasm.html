@@ -1266,7 +1266,10 @@ try{
     // down both grow the brush, left and up both shrink it.
     const dx = e.clientX - sizeDragStart.clientX;
     const dy = sizeDragStart.clientY - e.clientY;
-    const delta = dx * 0.6 - dy * 0.15;
+    // Convert the screen-space drag into canvas-space size units. Without
+    // this zoom correction resizing feels fast when zoomed in and slow when
+    // zoomed out because one brush pixel occupies a different screen size.
+    const delta = (dx * 0.6 - dy * 0.15) / Math.max(zoom, 0.01);
     let newSize = Math.round((sizeDragStart.size + delta) * 10) / 10;
     newSize = Math.min(Math.max(newSize, 0.1), 150);
     setBrushSize(newSize);
