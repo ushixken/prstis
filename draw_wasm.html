@@ -375,13 +375,12 @@ try{
     return Math.max(0, Math.min(1, 1 - y)); // curve stores y=0 as "max", flip to normal 0..1 influence
   }
 
-  // Minimum-size floor as a PERCENTAGE of the brush's own full size (matches
-  // the reference app's default 5%), not a fixed pixel amount — the curve
-  // above is what keeps light pressure thin, not this floor. A separate tiny
-  // absolute floor further down just stops the radius from hitting literal
-  // zero.
-  const MIN_SIZE_PERCENT = 0.05;
-  const MIN_ABS_RADIUS_BACKING = 0.125 * SS; // half a backing pixel: smallest gap-free dab
+  // Let pressure approach a true zero-relative diameter. Only the tiny
+  // absolute raster floor below prevents the dab from disappearing entirely.
+  const MIN_SIZE_PERCENT = 0;
+  // A fifth of a backing pixel remains continuous with quarter-pixel dab
+  // spacing while fading to a much finer TVPaint-like pressure tip.
+  const MIN_ABS_RADIUS_BACKING = 0.05 * SS;
   function pressureRadius(size, pressure){
     // At a nominal 1px brush, the ordinary radius produces a fourfold
     // jump from the smallest representable dab to full pressure. Keep this
