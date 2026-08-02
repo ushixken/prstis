@@ -273,7 +273,6 @@ try{
   let activePointerId = null; // the pointerId currently owning the in-progress stroke
   let hoverX = null, hoverY = null; // last known pointer position (wrap-relative), for the brush preview
   let hoverPointerType = 'mouse';
-  let hoverPressure = 1;
   let hovering = false;
   let chaseRAF = null;
   const undoStack = [];
@@ -1138,7 +1137,6 @@ try{
     hoverX = e.clientX - wrapRect.left;
     hoverY = e.clientY - wrapRect.top;
     hoverPointerType = e.pointerType;
-    hoverPressure = getPressure(e);
     hovering = true;
     if(isSizeDragging){ doSizeDrag(e); return; }
     if(isZoomDragging){ doZoomDrag(e); updateBrushPreview(); return; }
@@ -1150,7 +1148,6 @@ try{
   stageWrap.addEventListener('pointerenter', (e)=>{
     hovering = true;
     hoverPointerType = e.pointerType;
-    hoverPressure = getPressure(e);
     updateBrushPreview();
   });
   stageWrap.addEventListener('pointerleave', ()=>{
@@ -1367,19 +1364,7 @@ try{
   // their own preview via showSizePreview above).
   function updateBrushPreview(){
     if(isSizeDragging) return;
-    if(drawing){
-      if(hovering && hoverX !== null){
-        showSizePreview(
-          hoverX,
-          hoverY,
-          getBrushSize(),
-          hoverPointerType === 'pen' ? hoverPressure : 1
-        );
-      } else {
-        hideSizePreview();
-      }
-      return;
-    }
+    if(drawing){ hideSizePreview(); return; }
     if(isZoomDragging && zoomDragStart){
       // Pin the dab at the cursor position from *before* zooming started,
       // rather than tracking the live cursor while Ctrl+Space+drag is
