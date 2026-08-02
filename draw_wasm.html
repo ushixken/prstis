@@ -274,6 +274,7 @@ try{
   let hoverX = null, hoverY = null; // last known pointer position (wrap-relative), for the brush preview
   let hoverPointerType = 'mouse';
   let hovering = false;
+  let previewSuppressedUntilMove = false;
   let chaseRAF = null;
   const undoStack = [];
   const redoStack = [];
@@ -884,7 +885,8 @@ try{
       const a = pressureAlpha(pressure);
       const midStart = lastMid;
       const midEnd = { x: (lastRaw.x + raw.x) / 2, y: (lastRaw.y + raw.y) / 2 };
-      lastMid = drawQuadCurve(all, midStart, lastRaw, midEnd, r, r, a, 10);
+      const startR = lastR == null ? r : lastR;
+      lastMid = drawQuadCurve(all, midStart, lastRaw, midEnd, startR, r, a, 10);
       lastR = r;
       lastAlpha = a;
       prevRaw = lastRaw;
@@ -1028,7 +1030,7 @@ try{
       }
     };
 
-    endStroke = function(){
+    endStroke = function(e){
       if(!drawing) return;
       flushPendingStrokeSamples();
       drawing = false;
@@ -1037,7 +1039,10 @@ try{
       // original click dab round instead of stretching it.
       if(strokeMoved && lastMid && lastRaw){
         const all = [];
-        stampDabsAlong(all, lastMid, lastRaw, lastR, lastAlpha);
+        const liftPressure = e && e.pointerType === 'pen' && typeof e.pressure === 'number'
+          ? e.pressure : null;
+        const endR = liftPressure == null ? lastR : pressureRadius(getBrushSize(), liftPressure);
+        drawQuadCurve(all, lastMid, lastRaw, lastRaw, lastR, endR, lastAlpha, 10);
         if(all.length){
           const arr = new Float32Array(all);
           drawVertsIntoAcc(arr, arr.length / 8, colorRgb, tool === 'eraser');
@@ -1133,6 +1138,7 @@ try{
     if(drawing && activePointerId !== null && e.pointerId !== activePointerId) return;
     stageWrap.setPointerCapture(e.pointerId);
     activePointerId = e.pointerId;
+    previewSuppressedUntilMove = true;
     beginStroke(e);
     updateBrushPreview();
   });
@@ -1152,6 +1158,7 @@ try{
 
   stageWrap.addEventListener('pointerenter', (e)=>{
     hovering = true;
+    previewSuppressedUntilMove = false;
     hoverPointerType = e.pointerType;
     updateBrushPreview();
   });
@@ -1165,13 +1172,13 @@ try{
     if(isZoomDragging){ stopZoomDrag(); return; }
     if(isPanning){ stopPan(); return; }
     if(drawing && e.pointerId !== activePointerId) return;
-    endStroke();
+    endStroke(e);
     activePointerId = null;
     updateBrushPreview();
   });
   window.addEventListener('pointercancel', (e)=>{
     if(drawing && e.pointerId !== activePointerId){ return; }
-    endStroke();
+    endStroke(e);
     activePointerId = null;
     stopPan(); stopZoomDrag(); stopSizeDrag();
     updateBrushPreview();
@@ -1181,6 +1188,8 @@ try{
 
   // ---------- Panning ----------
   function startPan(e){
+    previewSuppressedUntilMove = true;
+    hideSizePreview();
     isPanning = true;
     panStart = {x: e.clientX, y: e.clientY, panX, panY};
     stageWrap.style.cursor = 'grab';
@@ -1193,6 +1202,7 @@ try{
     applyTransform();
   }
   function stopPan(){
+    previewSuppressedUntilMove = true;
     isPanning = false;
     panStart = null;
     updateIdleCursor();
@@ -1228,6 +1238,7 @@ try{
     applyTransform();
   }
   function stopZoomDrag(){
+    previewSuppressedUntilMove = true;
     isZoomDragging = false;
     zoomDragStart = null;
     updateIdleCursor();
@@ -1263,6 +1274,7 @@ try{
     showSizePreview(sizeDragStart.anchorX, sizeDragStart.anchorY, getBrushSize());
   }
   function stopSizeDrag(){
+    previewSuppressedUntilMove = true;
     isSizeDragging = false;
     sizeDragStart = null;
     updateIdleCursor();
@@ -1369,6 +1381,7 @@ try{
   // their own preview via showSizePreview above).
   function updateBrushPreview(){
     if(isSizeDragging) return;
+    if(isPanning){ hideSizePreview(); return; }
     if(drawing){ hideSizePreview(); return; }
     if(isZoomDragging && zoomDragStart){
       // Pin the dab at the cursor position from *before* zooming started,
@@ -1382,6 +1395,7 @@ try{
       }
       return;
     }
+    if(previewSuppressedUntilMove){ hideSizePreview(); return; }
     if(!hovering || hoverX === null) { hideSizePreview(); return; }
     if(hoverPointerType === 'pen'){
       // Match the brush engine's absolute lightest-pressure floor: a tiny
