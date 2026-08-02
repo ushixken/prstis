@@ -339,47 +339,20 @@ try{
     if(e.pointerType === 'mouse') return 1;
     return typeof e.pressure === 'number' ? Math.max(0, Math.min(1, e.pressure)) : 1;
   }
-  // Pressure -> visual weight, ported from the reference app's approach.
-  //
-  // A plain linear map (radius = floor + (full-floor)*pressure) turns out to
-  // be the real reason light pressure still looked heavy: most styli have an
-  // activation threshold, so the "lightest possible touch" the browser
-  // actually reports is rarely near 0 — it's commonly already 0.3-0.4. Fed
-  // straight into a linear map, that's already a third of the way to full
-  // size/opacity before the stroke can look faint at all.
-  //
-  // The fix is a CURVE, not a smaller floor: remap raw pressure through a
-  // "hard" response that stays low through most of the 0-1 range and only
-  // ramps up to full size near the very top of the pressure range. That way
-  // a real device's "light touch" (even if it reports ~0.35) still lands in
-  // the curve's flat low region and comes out thin, while a firm press still
-  // reaches full size. This is a cubic Bezier in "pressure in -> weight out"
-  // space; control points chosen to match the reference app's `hard` preset.
-  const PRESSURE_CURVE_HARD = [[0,1],[0.3,0.85],[0.7,0.4],[1,0]];
-  function bezierPointAt(pts, t){
-    const [p0,p1,p2,p3] = pts, mt = 1 - t;
-    const x = mt*mt*mt*p0[0] + 3*mt*mt*t*p1[0] + 3*mt*t*t*p2[0] + t*t*t*p3[0];
-    const y = mt*mt*mt*p0[1] + 3*mt*mt*t*p1[1] + 3*mt*t*t*p2[1] + t*t*t*p3[1];
-    return [x, y];
-  }
+  // Pressure controls diameter only. A continuous mild ease-in works with
+  // subpixel area coverage to transition smoothly from faint to fully dark.
   function pressureInfluence(pressure){
     const p = Math.max(0, Math.min(1, pressure == null ? 1 : pressure));
-    // Binary-search the Bezier's parameter t for the given input pressure x,
-    // then read off y at that t (curve x is monotonic, so this converges).
-    let lo = 0, hi = 1;
-    for(let i = 0; i < 24; i++){
-      const mid = (lo + hi) / 2;
-      if(bezierPointAt(PRESSURE_CURVE_HARD, mid)[0] < p) lo = mid; else hi = mid;
-    }
-    const y = bezierPointAt(PRESSURE_CURVE_HARD, (lo + hi) / 2)[1];
-    return Math.max(0, Math.min(1, 1 - y)); // curve stores y=0 as "max", flip to normal 0..1 influence
+    // A mild ease-in leaves room for a faint -> gray -> dark transition.
+    // Shader area correction handles the first near-zero footprint without
+    // requiring a discontinuous pressure cutoff.
+    return Math.pow(p, 1.2);
   }
-
   // Let pressure approach a true zero-relative diameter. Only the tiny
   // absolute raster floor below prevents the dab from disappearing entirely.
   const MIN_SIZE_PERCENT = 0;
-  // A fifth of a backing pixel remains continuous with quarter-pixel dab
-  // spacing while fading to a much finer TVPaint-like pressure tip.
+  // A fifth of a backing pixel stays pale through area-based coverage while
+  // remaining consistently visible between quarter-pixel-spaced dabs.
   const MIN_ABS_RADIUS_BACKING = 0.05 * SS;
   function pressureRadius(size, pressure){
     // At a nominal 1px brush, the ordinary radius produces a fourfold
@@ -394,8 +367,9 @@ try{
     return Math.max(MIN_ABS_RADIUS_BACKING, r);
   }
 
-  // Hard Round pressure controls diameter only. Opacity remains exactly at
-  // the opacity slider value, including at the lightest pen pressure.
+  // Hard Round pressure changes diameter, not paint opacity. The dark center
+  // remains at the opacity-slider value even at the lightest pressure; only
+  // fractional raster coverage makes the subpixel edge appear gray.
   function pressureAlpha(_pressure){
     return opacity;
   }
@@ -499,9 +473,13 @@ try{
         // instead of a fixed constant that can end up too wide.
         let aa = max(fwidth(d), 1e-4);
         let cov = clamp(0.5 - d / aa, 0.0, 1.0);
+        // An SDF step overestimates circles smaller than one backing pixel:
+        // a near-zero circle centered on a fragment can still return ~50%
+        // coverage. Scale tiny dabs by their physical circle area.
+        let subpixelArea = min(1.0, 3.14159265 * in.r * in.r);
         // The stroke target is a one-channel coverage mask. Maximum blending
         // keeps the strongest coverage and rejects redundant interior overdraw.
-        return vec4f(in.alpha * cov, 0.0, 0.0, 1.0);
+        return vec4f(in.alpha * cov * subpixelArea, 0.0, 0.0, 1.0);
       }
     `});
 
