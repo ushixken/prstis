@@ -814,6 +814,54 @@ try{
     let lastInputRaw = null;
     let lastInputPressure = 0;
 
+    // --- Contact pressure tracking --------------------------------------
+    // Some pen/tablet stacks emit one or more pointermove samples with
+    // pressure decaying toward 0 as the tip leaves the surface, *before*
+    // pointerup actually fires — these are release artifacts, not real
+    // drawing input. lastContactPressure only updates from samples above a
+    // small contact floor, so it always reflects genuine "pen down and
+    // pressing" pressure, never a trailing near-zero sample and never the
+    // pointerup event's own (usually 0) pressure value.
+    const CONTACT_PRESSURE_FLOOR = 0.02;
+    let lastContactPressure = 0;
+
+    // Debug/validation hook (goal: "test with position-only debug mode").
+    // window.setStabDebugConstantPressure(true) forces every sample's
+    // pressure — including finish — to a fixed 0.7, isolating position
+    // catch-up from pressure handling for testing.
+    let DEBUG_CONSTANT_PRESSURE = false;
+    window.setStabDebugConstantPressure = (on) => {
+      DEBUG_CONSTANT_PRESSURE = !!on;
+      console.log('[stabilizer debug] constant pressure override:', DEBUG_CONSTANT_PRESSURE);
+    };
+    function effectivePressure(p){
+      return DEBUG_CONSTANT_PRESSURE ? 0.7 : p;
+    }
+
+    // --- Finish-stage velocity tracking --------------------------------
+    // Tracks the actual (unstabilized) pointer speed during normal drawing
+    // so the accelerated finish (below) can tell a fast flick from a slow,
+    // deliberate stroke. This only records metadata alongside existing
+    // sample processing — it doesn't change curve reconstruction, spacing,
+    // or what gets drawn during a normal stroke.
+    let recentSpeedPxMs = 0;
+    let lastVelRaw = null;
+    let lastVelTime = 0;
+    function trackVelocity(raw, timeStamp){
+      const now = Number.isFinite(timeStamp) ? timeStamp : performance.now();
+      if(lastVelRaw && lastVelTime){
+        const dt = now - lastVelTime;
+        if(dt > 0){
+          const dist = Math.hypot(raw.x - lastVelRaw.x, raw.y - lastVelRaw.y);
+          const inst = dist / dt;
+          // Light exponential smoothing so one noisy sample can't spike it.
+          recentSpeedPxMs = recentSpeedPxMs * 0.7 + inst * 0.3;
+        }
+      }
+      lastVelRaw = raw;
+      lastVelTime = now;
+    }
+
     function movingAverageAmount(){
       if(stabilization <= 0) return 1;
       return Math.max(2, Math.round(stabilization * 100));
@@ -839,10 +887,15 @@ try{
       strokeMoved = false;
       smoothBuf = [p];
       lastInputRaw = p;
-      lastInputPressure = getPressure(e);
-      const r = pressureRadius(getBrushSize(), getPressure(e));
+      const startPressure = effectivePressure(getPressure(e));
+      lastInputPressure = startPressure;
+      lastContactPressure = startPressure;
+      recentSpeedPxMs = 0;
+      lastVelRaw = p;
+      lastVelTime = performance.now();
+      const r = pressureRadius(getBrushSize(), startPressure);
       lastR = r;
-      const a = pressureAlpha(getPressure(e));
+      const a = pressureAlpha(startPressure);
       lastAlpha = a;
       const verts = circleVerts(p.x, p.y, r, a);
       drawVertsIntoAcc(new Float32Array(verts), verts.length / 9, colorRgb, tool === 'eraser');
@@ -897,9 +950,15 @@ try{
       let all = [];
       for(const ev of events){
         const inputRaw = screenToCanvas(ev.clientX, ev.clientY);
-        const pressure = getPressure(ev);
+        const rawPressure = getPressure(ev);
+        const pressure = effectivePressure(rawPressure);
+        trackVelocity(inputRaw, ev.timeStamp);
         lastInputRaw = inputRaw;
         lastInputPressure = pressure;
+        // Only real contact pressure above the floor updates the value used
+        // to freeze the finish — a trailing near-zero sample right before
+        // release (tip lifting off) must not overwrite it.
+        if(pressure > CONTACT_PRESSURE_FLOOR) lastContactPressure = pressure;
         const raw = pushSmoothBuf(inputRaw);
         const jumpDx = raw.x - lastRaw.x, jumpDy = raw.y - lastRaw.y;
         const jumpDist = Math.hypot(jumpDx, jumpDy);
@@ -1001,42 +1060,7 @@ try{
       strokeHoldRAF = requestAnimationFrame(strokeHoldTick);
     }
 
-    endStroke = function(e){
-      if(!drawing) return;
-      if(strokeHoldRAF !== null){
-        cancelAnimationFrame(strokeHoldRAF);
-        strokeHoldRAF = null;
-      }
-      flushPendingStrokeSamples();
-      drawing = false;
-      // Finish the remaining midpoint curve with the same analytic capsule
-      // coverage and interpolate naturally toward the pen's lift radius.
-      if(strokeMoved && lastMid && lastRaw){
-        const all = [];
-
-        // Catch Up approximation: repeatedly insert the final physical
-        // endpoint. The finite window drains in at most N-1 synthetic ticks.
-        // Geometry completes immediately; real LNP timing remains unknown.
-        const catchUpTicks = movingAverageAmount() - 1;
-        const catchUpEndpoint = e && Number.isFinite(e.clientX) && Number.isFinite(e.clientY)
-          ? screenToCanvas(e.clientX, e.clientY) : lastInputRaw;
-        if(catchUpTicks > 0 && catchUpEndpoint){
-          for(let i = 0; i < catchUpTicks; i++){
-            const caught = pushSmoothBuf(catchUpEndpoint);
-            if(Math.hypot(caught.x - lastRaw.x, caught.y - lastRaw.y) > 1e-4){
-              feedPoint(all, caught, lastInputPressure);
-            }
-          }
-        }
-        const liftPressure = e && e.pointerType === 'pen' && typeof e.pressure === 'number'
-          ? e.pressure : null;
-        const endR = liftPressure == null ? lastR : pressureRadius(getBrushSize(), liftPressure);
-        drawQuadCurve(all, lastMid, lastRaw, lastRaw, lastR, endR, lastAlpha, 10);
-        if(all.length){
-          const arr = new Float32Array(all);
-          drawVertsIntoAcc(arr, arr.length / 9, colorRgb, tool === 'eraser');
-        }
-      }
+    function resetStrokeState(){
       prevRaw = null;
       lastRaw = null;
       lastMid = null;
@@ -1045,6 +1069,159 @@ try{
       smoothBuf = [];
       lastInputRaw = null;
       lastInputPressure = 0;
+      lastContactPressure = 0;
+      lastVelRaw = null;
+      lastVelTime = 0;
+      recentSpeedPxMs = 0;
+    }
+
+    function logFinishDiagnostics(diag){
+      console.log('[stabilizer finish]', {
+        finishDurationMs: Math.round(diag.finishDurationMs),
+        maxCatchUpSpeedPxPerMs: +diag.maxCatchUpSpeedPxMs.toFixed(3),
+        startGapPx: +diag.startDist.toFixed(2),
+        endpointErrorPx: +diag.endpointError.toFixed(4),
+        lastContactPressure: +diag.lastContactPressure.toFixed(3),
+        pointerupRawPressure: diag.pointerupRawPressure,
+        emittedPressureConstant: +diag.emittedPressureConstant.toFixed(3),
+        finalDabRadius: +diag.finalDabRadius.toFixed(2),
+        finalDabAlpha: +diag.finalDabAlpha.toFixed(3),
+        ticksEmitted: diag.ticksEmitted
+      });
+    }
+
+    let finishRAF = null;
+
+    endStroke = function(e){
+      if(!drawing) return;
+      if(strokeHoldRAF !== null){
+        cancelAnimationFrame(strokeHoldRAF);
+        strokeHoldRAF = null;
+      }
+      if(finishRAF !== null){
+        cancelAnimationFrame(finishRAF);
+        finishRAF = null;
+      }
+      flushPendingStrokeSamples();
+      drawing = false;
+
+      if(!(strokeMoved && lastMid && lastRaw)){
+        resetStrokeState();
+        return;
+      }
+
+      const endpoint = e && Number.isFinite(e.clientX) && Number.isFinite(e.clientY)
+        ? screenToCanvas(e.clientX, e.clientY) : lastInputRaw;
+
+      // Goal 1/3: the pressure used for the entire finish is the last
+      // genuine *contact* pressure (see lastContactPressure tracking in
+      // processStrokeBatch) — never the pointerup event's own pressure,
+      // which is commonly 0 as the tip leaves the surface, and never a
+      // trailing near-zero sample. It is captured once, held constant
+      // through the whole catch-up, and used verbatim for the final snap.
+      // There is currently no separate "end taper" brush feature; if one is
+      // ever added it must hook in here explicitly, not via pointerup
+      // pressure or an assumed fade-to-zero.
+      const finishPressure = lastContactPressure;
+      const pointerupRawPressure = e && typeof e.pressure === 'number' ? e.pressure : null;
+
+      const startDist = endpoint ? Math.hypot(endpoint.x - lastRaw.x, endpoint.y - lastRaw.y) : 0;
+
+      if(!endpoint || startDist < 0.15){
+        // Nothing meaningful to catch up on (stabilization off, or the pen
+        // lifted essentially where it was already drawn to).
+        const all = [];
+        if(endpoint) feedPoint(all, endpoint, finishPressure);
+        if(all.length){
+          const arr = new Float32Array(all);
+          drawVertsIntoAcc(arr, arr.length / 9, colorRgb, tool === 'eraser');
+        }
+        resetStrokeState();
+        return;
+      }
+
+      const diag = {
+        startTime: performance.now(),
+        startDist,
+        lastContactPressure: finishPressure,
+        pointerupRawPressure,
+        emittedPressureConstant: finishPressure,
+        maxCatchUpSpeedPxMs: 0,
+        finishDurationMs: 0,
+        endpointError: 0,
+        finalDabRadius: 0,
+        finalDabAlpha: 0,
+        ticksEmitted: 0
+      };
+      let lastTickTime = diag.startTime;
+
+      // Goal 2/6: Accelerated Finish Line. Every tick still advances the
+      // exact same moving-average buffer used during normal drawing (see
+      // pushSmoothBuf/feedPoint) — this is what keeps the finish following
+      // the real stabilized trajectory instead of a shortcut straight line.
+      // What changes at release is only the *rate*: ticksPerMs ramps up as
+      // progress increases (eased, not linear) and is scaled by how fast
+      // the hand was actually moving right before lift, so a flick commits
+      // to the endpoint quickly and a slow stroke eases in more gently.
+      // Pressure is NOT part of this ramp at all (goal 1/3/4): every tick,
+      // including the final exact snap, uses the same frozen finishPressure
+      // — position and pressure are fully decoupled, so the tail keeps a
+      // consistent, rounded body instead of thinning out as it catches up.
+      function finishTick(t){
+        finishRAF = null;
+        const now = Number.isFinite(t) ? t : performance.now();
+        const dt = Math.min(now - lastTickTime, 60);
+        lastTickTime = now;
+
+        const remaining = Math.hypot(endpoint.x - lastRaw.x, endpoint.y - lastRaw.y);
+
+        if(remaining <= 0.15 || smoothBuf.length === 0){
+          const all = [];
+          feedPoint(all, endpoint, finishPressure);
+          if(all.length){
+            const arr = new Float32Array(all);
+            drawVertsIntoAcc(arr, arr.length / 9, colorRgb, tool === 'eraser');
+          }
+          diag.endpointError = Math.hypot(endpoint.x - lastRaw.x, endpoint.y - lastRaw.y);
+          diag.finishDurationMs = now - diag.startTime;
+          diag.finalDabRadius = pressureRadius(getBrushSize(), finishPressure);
+          diag.finalDabAlpha = pressureAlpha(finishPressure);
+          logFinishDiagnostics(diag);
+          resetStrokeState();
+          return;
+        }
+
+        const progress = 1 - (remaining / startDist);
+        const baseTicksPerMs = movingAverageAmount() / 260; // baseline drain rate
+        const accel = 1 + 3 * (progress * progress);        // eases in, not linear
+        const speedFactor = Math.max(0.5, Math.min(3, 0.6 + recentSpeedPxMs * 1.2));
+        const ticksPerMs = baseTicksPerMs * accel * speedFactor;
+        const maxTicks = movingAverageAmount();
+        const ticks = Math.max(1, Math.min(maxTicks, Math.round(dt * ticksPerMs)));
+
+        const all = [];
+        for(let i = 0; i < ticks; i++){
+          const caught = pushSmoothBuf(endpoint);
+          const stepDist = Math.hypot(caught.x - lastRaw.x, caught.y - lastRaw.y);
+          if(stepDist <= 1e-4) break;
+
+          const stepSpeed = stepDist / Math.max(dt / ticks, 0.001);
+          if(stepSpeed > diag.maxCatchUpSpeedPxMs) diag.maxCatchUpSpeedPxMs = stepSpeed;
+          diag.ticksEmitted++;
+
+          // Goal 7: pressure and position come from the same tick, so they
+          // can never drift out of sync — but pressure here is always the
+          // frozen constant, never derived from position/progress.
+          feedPoint(all, caught, finishPressure);
+        }
+        if(all.length){
+          const arr = new Float32Array(all);
+          drawVertsIntoAcc(arr, arr.length / 9, colorRgb, tool === 'eraser');
+        }
+        finishRAF = requestAnimationFrame(finishTick);
+      }
+
+      finishRAF = requestAnimationFrame(finishTick);
     };
 
   } else {
