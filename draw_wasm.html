@@ -494,7 +494,9 @@ try{
         // instead of a fixed constant that can end up too wide.
         let aa = max(fwidth(d), 1e-4);
         let cov = clamp(0.5 - d / aa, 0.0, 1.0);
-        return vec4f(rgb, in.alpha * cov);
+        // The stroke target is a one-channel coverage mask. Maximum blending
+        // keeps the strongest coverage and rejects redundant interior overdraw.
+        return vec4f(in.alpha * cov, 0.0, 0.0, 1.0);
       }
     `});
 
@@ -516,10 +518,10 @@ try{
       fragment: {
         module: strokeShader, entryPoint: 'fs',
         targets: [{
-          format: 'rgba8unorm',
+          format: 'r8unorm',
           blend: {
-            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-            alpha: { srcFactor: 'one', dstFactor: 'zero', operation: 'add' },
+            color: { srcFactor: 'one', dstFactor: 'one', operation: 'max' },
+            alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'max' },
           }
         }]
       },
@@ -553,6 +555,11 @@ try{
       });
     }
     let accTex = makeAccTex();
+    const strokeMaskTex = device.createTexture({
+      size: [BW, BH], format: 'r8unorm',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    let strokeCompositeBindGroup = null;
 
     function clearTexToWhite(tex){
       const enc = device.createCommandEncoder();
@@ -599,6 +606,75 @@ try{
     }
     let blitBindGroup = makeBlitBindGroup(accTex);
 
+    const compositeShader = device.createShaderModule({ code: `
+      struct VSOut { @builtin(position) pos: vec4f };
+      struct CompositeUniforms { color: vec3f, mode: f32 };
+      @group(0) @binding(0) var baseTex: texture_2d<f32>;
+      @group(0) @binding(1) var maskTex: texture_2d<f32>;
+      @group(0) @binding(2) var<uniform> u: CompositeUniforms;
+      @vertex
+      fn vs(@builtin(vertex_index) i: u32) -> VSOut {
+        var p = array<vec2f,3>(vec2f(-1.0,-1.0), vec2f(3.0,-1.0), vec2f(-1.0,3.0));
+        var out: VSOut;
+        out.pos = vec4f(p[i], 0.0, 1.0);
+        return out;
+      }
+      @fragment
+      fn fs(in: VSOut) -> @location(0) vec4f {
+        let pixel = vec2i(in.pos.xy);
+        let base = textureLoad(baseTex, pixel, 0).rgb;
+        let coverage = textureLoad(maskTex, pixel, 0).r;
+        let paint = select(u.color, vec3f(1.0), u.mode > 0.5);
+        return vec4f(mix(base, paint, coverage), 1.0);
+      }
+    `});
+    const compositePipeline = device.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module: compositeShader, entryPoint: 'vs' },
+      fragment: { module: compositeShader, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
+      primitive: { topology: 'triangle-list' },
+    });
+    const compositeUniformBuf = device.createBuffer({
+      size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+
+    function clearStrokeMask(){
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{ view: strokeMaskTex.createView(), loadOp: 'clear', storeOp: 'store', clearValue: {r:0,g:0,b:0,a:0} }]
+      });
+      pass.end();
+      device.queue.submit([enc.finish()]);
+    }
+
+    function beginStrokeCoverage(){
+      clearStrokeMask();
+      const baseTex = undoStack[undoStack.length - 1];
+      strokeCompositeBindGroup = device.createBindGroup({
+        layout: compositePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: baseTex.createView() },
+          { binding: 1, resource: strokeMaskTex.createView() },
+          { binding: 2, resource: { buffer: compositeUniformBuf } },
+        ]
+      });
+    }
+
+    function compositeStroke(colorRgbArr, isEraser){
+      device.queue.writeBuffer(compositeUniformBuf, 0, new Float32Array([
+        colorRgbArr[0], colorRgbArr[1], colorRgbArr[2], isEraser ? 1 : 0
+      ]));
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{ view: accTex.createView(), loadOp: 'clear', storeOp: 'store', clearValue: {r:1,g:1,b:1,a:1} }]
+      });
+      pass.setPipeline(compositePipeline);
+      pass.setBindGroup(0, strokeCompositeBindGroup);
+      pass.draw(3);
+      pass.end();
+      device.queue.submit([enc.finish()]);
+    }
+
     function present(){
       const enc = device.createCommandEncoder();
       const pass = enc.beginRenderPass({
@@ -624,7 +700,7 @@ try{
 
       const enc = device.createCommandEncoder();
       const pass = enc.beginRenderPass({
-        colorAttachments: [{ view: accTex.createView(), loadOp: 'load', storeOp: 'store' }]
+        colorAttachments: [{ view: strokeMaskTex.createView(), loadOp: 'load', storeOp: 'store' }]
       });
       pass.setPipeline(strokePipeline);
       pass.setBindGroup(0, strokeBindGroup);
@@ -632,6 +708,7 @@ try{
       pass.draw(vertCount);
       pass.end();
       device.queue.submit([enc.finish()]);
+      compositeStroke(colorRgbArr, isEraser);
       present();
     }
 
@@ -748,6 +825,7 @@ try{
       if(chaseRAF){ cancelAnimationFrame(chaseRAF); chaseRAF = null; }
       const p = screenToCanvas(e.clientX, e.clientY);
       pushUndo();
+      beginStrokeCoverage();
       drawing = true;
       prevRaw = p;
       lastRaw = p;
@@ -769,12 +847,7 @@ try{
       const len = Math.hypot(dx, dy);
       if(len <= 0) return;
       const spacing = DAB_SPACING_BACKING;
-      // Source-over blending compounds opacity where neighboring dabs
-      // overlap. Divide the requested opacity across the approximate number
-      // of dabs covering the stroke center so the finished stroke retains
-      // the opacity of one isolated dab.
-      const overlapCount = Math.max(1, (2 * r) / spacing);
-      const stampAlpha = 1 - Math.pow(1 - alpha, 1 / overlapCount);
+      const stampAlpha = alpha; // maximum coverage prevents overlap buildup
       let travelled = distanceToNextDab;
       while(travelled <= len){
         const t = travelled / len;
