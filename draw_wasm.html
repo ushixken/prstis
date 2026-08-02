@@ -314,7 +314,7 @@ try{
     // texels as crisp blocks — like the classic "zoomed into a raster line"
     // reference — instead of the browser smearing them into a photographic
     // blur. Below the threshold, smooth bilinear interpolation looks right.
-    canvas.style.imageRendering = zoom >= 2 ? 'pixelated' : 'auto';
+    canvas.style.imageRendering = zoom >= 3.01 ? 'pixelated' : 'auto';
     if(typeof updateBrushPreview === 'function') updateBrushPreview();
   }
 
@@ -806,7 +806,6 @@ try{
                               // plain click with no movement already got its dot from beginStroke,
                               // so endStroke shouldn't stamp a second one on top of it
     let lastFedRaw = null; // last raw (pre-smoothing) point that cleared the deadzone
-    let latestStrokeTarget = null;
     let smoothBuf = [];    // windowed moving-average buffer (the piece that was missing)
 
     // The EMA lag above only damps a fraction of each individual jump — it
@@ -839,7 +838,6 @@ try{
       lastRaw = p;
       lastMid = p;
       lastFedRaw = p;
-      latestStrokeTarget = { x: p.x, y: p.y, pressure: getPressure(e) };
       strokeMoved = false;
       smoothBuf = [p];
       const r = pressureRadius(getBrushSize(), getPressure(e));
@@ -939,7 +937,6 @@ try{
       let all = [];
       for(const ev of events){
         let raw = screenToCanvas(ev.clientX, ev.clientY);
-        latestStrokeTarget = { x: raw.x, y: raw.y, pressure: getPressure(ev) };
 
         // Drop sub-deadzone movement outright instead of smoothing it in —
         // this is what actually removes the wobble at its source, rather
@@ -980,54 +977,11 @@ try{
           feedPoint(all, raw, pressure);
         }
       }
-      // Midpoint reconstruction intentionally leaves the newest half of the
-      // curve pending for the next sample. Flush only that pending tail once
-      // per display batch so the visible stroke reaches the current filtered
-      // pointer without changing smoothing, subdivision, or per-sample path
-      // reconstruction (which must remain stable when zoomed out).
-      if(all.length && lastMid && lastRaw &&
-         Math.hypot(lastRaw.x - lastMid.x, lastRaw.y - lastMid.y) > 1e-4){
-        lastMid = drawQuadCurve(
-          all, lastMid, lastRaw, lastRaw,
-          lastR, lastR, lastAlpha, 10
-        );
-      }
       if(all.length){
         const arr = new Float32Array(all);
         drawVertsIntoAcc(arr, arr.length / 9, colorRgb, tool === 'eraser');
       }
       reportPerf(performance.now() - t0);
-      scheduleStrokeCatchup();
-    }
-
-    // Continue evaluating the existing stabilized path after input events
-    // pause, until its endpoint reaches the latest real pointer position.
-    function scheduleStrokeCatchup(){
-      if(chaseRAF || !drawing || !latestStrokeTarget || !lastRaw) return;
-      chaseRAF = requestAnimationFrame(()=>{
-        chaseRAF = null;
-        if(!drawing || !latestStrokeTarget || !lastRaw) return;
-        const dx = latestStrokeTarget.x - lastRaw.x;
-        const dy = latestStrokeTarget.y - lastRaw.y;
-        const distance = Math.hypot(dx, dy);
-        const tolerance = (0.1 * SS) / Math.max(zoom, 0.01);
-        if(distance <= tolerance) return;
-
-        const follow = 1 - stabilization * 0.65;
-        const next = distance * (1 - follow) <= tolerance
-          ? latestStrokeTarget
-          : { x: lastRaw.x + dx * follow, y: lastRaw.y + dy * follow };
-        const all = [];
-        feedPoint(all, next, latestStrokeTarget.pressure);
-        if(lastMid && lastRaw){
-          lastMid = drawQuadCurve(all, lastMid, lastRaw, lastRaw, lastR, lastR, lastAlpha, 10);
-        }
-        if(all.length){
-          const arr = new Float32Array(all);
-          drawVertsIntoAcc(arr, arr.length / 9, colorRgb, tool === 'eraser');
-        }
-        scheduleStrokeCatchup();
-      });
     }
 
     // Pointer events only collect samples. Rendering happens at most once per
@@ -1046,7 +1000,6 @@ try{
       processStrokeBatch({ getCoalescedEvents(){ return samples; } });
     }
     moveStroke = function(e){
-      if(chaseRAF){ cancelAnimationFrame(chaseRAF); chaseRAF = null; }
       const source = (typeof e.getCoalescedEvents === 'function' && e.getCoalescedEvents().length)
         ? e.getCoalescedEvents() : [e];
       for(const ev of source){
@@ -1067,33 +1020,7 @@ try{
 
     endStroke = function(e){
       if(!drawing) return;
-      if(chaseRAF){ cancelAnimationFrame(chaseRAF); chaseRAF = null; }
       flushPendingStrokeSamples();
-      // A quick flick may release before the scheduled chase frame. Advance
-      // through bounded substeps to the last target before closing the stroke.
-      if(latestStrokeTarget && lastRaw){
-        const dx = latestStrokeTarget.x - lastRaw.x;
-        const dy = latestStrokeTarget.y - lastRaw.y;
-        const distance = Math.hypot(dx, dy);
-        if(distance > 1e-4){
-          const all = [];
-          const maxStep = Math.max(2, scaledBrushSize() * 0.6);
-          const steps = Math.max(1, Math.ceil(distance / maxStep));
-          const origin = lastRaw;
-          for(let i = 1; i <= steps; i++){
-            const t = i / steps;
-            feedPoint(all, {
-              x: origin.x + dx * t,
-              y: origin.y + dy * t
-            }, latestStrokeTarget.pressure);
-          }
-          if(lastMid && lastRaw){
-            lastMid = drawQuadCurve(all, lastMid, lastRaw, lastRaw, lastR, lastR, lastAlpha, 10);
-          }
-          const arr = new Float32Array(all);
-          drawVertsIntoAcc(arr, arr.length / 9, colorRgb, tool === 'eraser');
-        }
-      }
       drawing = false;
       // Finish the remaining midpoint curve with the same analytic capsule
       // coverage and interpolate naturally toward the pen's lift radius.
@@ -1114,7 +1041,6 @@ try{
       lastR = null;
       lastAlpha = null;
       lastFedRaw = null;
-      latestStrokeTarget = null;
       smoothBuf = [];
     };
 
@@ -1413,7 +1339,7 @@ try{
     sizePreview.style.height = cssSize + 'px';
     // Same rule the main canvas uses: crisp blocky texels once zoomed in
     // past the threshold, smooth bilinear scaling below it.
-    sizePreview.style.imageRendering = zoom >= 2 ? 'pixelated' : 'auto';
+    sizePreview.style.imageRendering = zoom >= 3.01 ? 'pixelated' : 'auto';
 
     if(sizePreview.width !== backingSize || sizePreview.height !== backingSize){
       sizePreview.width = backingSize;
