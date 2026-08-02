@@ -713,7 +713,11 @@ try{
     let lastR = null;     // radius actually used for the most recent segment (tracks pressure taper)
     let lastAlpha = null; // alpha actually used for the most recent segment (tracks pressure taper)
     let distanceToNextDab = 0; // spacing carry so tiny pointer motion does not stretch a dab
-    const DAB_SPACING_BACKING = 1; // one backing-store pixel (1/SS canvas pixel) between dab centers
+    // Keep stamps denser than one backing pixel so their centers advance
+    // through different fractional texel phases. This makes the Hard Round
+    // edge evolve while moving, matching the hover preview, instead of
+    // repeating one frozen antialiasing pattern along straight strokes.
+    const DAB_SPACING_BACKING = 0.75;
     let strokeMoved = false; // true once at least one point has been fed after beginStroke — a
                               // plain click with no movement already got its dot from beginStroke,
                               // so endStroke shouldn't stamp a second one on top of it
