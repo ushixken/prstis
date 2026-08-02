@@ -273,6 +273,7 @@ try{
   let activePointerId = null; // the pointerId currently owning the in-progress stroke
   let hoverX = null, hoverY = null; // last known pointer position (wrap-relative), for the brush preview
   let hoverPointerType = 'mouse';
+  let hoverPressure = 1;
   let hovering = false;
   let chaseRAF = null;
   const undoStack = [];
@@ -790,11 +791,10 @@ try{
     let lastR = null;     // radius actually used for the most recent segment (tracks pressure taper)
     let lastAlpha = null; // alpha actually used for the most recent segment (tracks pressure taper)
     let distanceToNextDab = 0; // spacing carry so tiny pointer motion does not stretch a dab
-    // Keep stamps denser than one backing pixel so their centers advance
-    // through different fractional texel phases. This makes the Hard Round
-    // edge evolve while moving, matching the hover preview, instead of
-    // repeating one frozen antialiasing pattern along straight strokes.
-    const DAB_SPACING_BACKING = 0.75;
+    // Quarter-backing-pixel spacing places dabs at true subpixel positions:
+    // with SS=4 this is 1/16 of a canvas pixel. Fractional centers advance
+    // smoothly through the raster grid instead of stepping pixel by pixel.
+    const DAB_SPACING_BACKING = 0.25;
     let strokeMoved = false; // true once at least one point has been fed after beginStroke — a
                               // plain click with no movement already got its dot from beginStroke,
                               // so endStroke shouldn't stamp a second one on top of it
@@ -1138,6 +1138,7 @@ try{
     hoverX = e.clientX - wrapRect.left;
     hoverY = e.clientY - wrapRect.top;
     hoverPointerType = e.pointerType;
+    hoverPressure = getPressure(e);
     hovering = true;
     if(isSizeDragging){ doSizeDrag(e); return; }
     if(isZoomDragging){ doZoomDrag(e); updateBrushPreview(); return; }
@@ -1149,6 +1150,7 @@ try{
   stageWrap.addEventListener('pointerenter', (e)=>{
     hovering = true;
     hoverPointerType = e.pointerType;
+    hoverPressure = getPressure(e);
     updateBrushPreview();
   });
   stageWrap.addEventListener('pointerleave', ()=>{
@@ -1365,7 +1367,19 @@ try{
   // their own preview via showSizePreview above).
   function updateBrushPreview(){
     if(isSizeDragging) return;
-    if(drawing){ hideSizePreview(); return; }
+    if(drawing){
+      if(hovering && hoverX !== null){
+        showSizePreview(
+          hoverX,
+          hoverY,
+          getBrushSize(),
+          hoverPointerType === 'pen' ? hoverPressure : 1
+        );
+      } else {
+        hideSizePreview();
+      }
+      return;
+    }
     if(isZoomDragging && zoomDragStart){
       // Pin the dab at the cursor position from *before* zooming started,
       // rather than tracking the live cursor while Ctrl+Space+drag is
