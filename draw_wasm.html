@@ -382,7 +382,12 @@ try{
   const MIN_SIZE_PERCENT = 0.05;
   const MIN_ABS_RADIUS_BACKING = 0.125 * SS; // half a backing pixel: smallest gap-free dab
   function pressureRadius(size, pressure){
-    const full = (size * SS) / 2;
+    // At a nominal 1px brush, the ordinary radius produces a fourfold
+    // jump from the smallest representable dab to full pressure. Keep this
+    // smallest raster preset within a tighter TVPaint-like subpixel range.
+    // Brushes 2px and larger retain their existing full-pressure diameter.
+    const onePixelScale = size <= 1 ? 0.5 : 1;
+    const full = (size * SS) / 2 * onePixelScale;
     const influence = pressureInfluence(pressure);
     const minR = full * MIN_SIZE_PERCENT;
     const r = minR + (full - minR) * influence;
@@ -1369,7 +1374,12 @@ try{
       // Pin the dab at the cursor position from *before* zooming started,
       // rather than tracking the live cursor while Ctrl+Space+drag is
       // actively changing the zoom.
-      showSizePreview(zoomDragStart.anchorX, zoomDragStart.anchorY, getBrushSize());
+      if(hoverPointerType === 'pen'){
+        const lightestDiameter = 2 * MIN_ABS_RADIUS_BACKING / SS;
+        showSizePreview(zoomDragStart.anchorX, zoomDragStart.anchorY, getBrushSize(), 0, lightestDiameter);
+      } else {
+        showSizePreview(zoomDragStart.anchorX, zoomDragStart.anchorY, getBrushSize());
+      }
       return;
     }
     if(!hovering || hoverX === null) { hideSizePreview(); return; }
