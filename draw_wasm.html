@@ -331,13 +331,13 @@ try{
   }
 
   function getPressure(e){
-    if(e.pointerType === 'pen' && typeof e.pressure === 'number' && e.pressure > 0){
-      return e.pressure;
-    }
+    // A hovering/contact-threshold pen legitimately reports zero. Treating
+    // zero as a missing value made the lightest touch jump to full pressure.
+    if(e.pointerType === 'pen' && typeof e.pressure === 'number')
+      return Math.max(0, Math.min(1, e.pressure));
     if(e.pointerType === 'mouse') return 1;
-    return e.pressure || 1;
+    return typeof e.pressure === 'number' ? Math.max(0, Math.min(1, e.pressure)) : 1;
   }
-
   // Pressure -> visual weight, ported from the reference app's approach.
   //
   // A plain linear map (radius = floor + (full-floor)*pressure) turns out to
@@ -380,7 +380,7 @@ try{
   // absolute floor further down just stops the radius from hitting literal
   // zero.
   const MIN_SIZE_PERCENT = 0.05;
-  const MIN_ABS_RADIUS_BACKING = 0.1 * SS; // never fully vanish
+  const MIN_ABS_RADIUS_BACKING = 0.125 * SS; // half a backing pixel: smallest gap-free dab
   function pressureRadius(size, pressure){
     const full = (size * SS) / 2;
     const influence = pressureInfluence(pressure);
@@ -389,15 +389,11 @@ try{
     return Math.max(MIN_ABS_RADIUS_BACKING, r);
   }
 
-  // Alpha follows the SAME curve/influence as radius, so width and darkness
-  // taper in lockstep — no fixed alpha floor beyond a tiny anti-invisibility
-  // clamp, so a genuinely light touch can look genuinely faint.
-  const MIN_ALPHA = 0.02;
-  function pressureAlpha(pressure){
-    const influence = pressureInfluence(pressure);
-    return Math.max(MIN_ALPHA, opacity * influence);
+  // Hard Round pressure controls diameter only. Opacity remains exactly at
+  // the opacity slider value, including at the lightest pen pressure.
+  function pressureAlpha(_pressure){
+    return opacity;
   }
-
   const scaledBrushSize = () => getBrushSize() * SS;
 
   // These get assigned by whichever engine (WebGPU or Canvas2D) initializes below.
@@ -716,6 +712,8 @@ try{
     let lastMid = null;   // last curve endpoint actually drawn (midpoint-based)
     let lastR = null;     // radius actually used for the most recent segment (tracks pressure taper)
     let lastAlpha = null; // alpha actually used for the most recent segment (tracks pressure taper)
+    let distanceToNextDab = 0; // spacing carry so tiny pointer motion does not stretch a dab
+    const DAB_SPACING_BACKING = 1; // one backing-store pixel (1/SS canvas pixel) between dab centers
     let strokeMoved = false; // true once at least one point has been fed after beginStroke — a
                               // plain click with no movement already got its dot from beginStroke,
                               // so endStroke shouldn't stamp a second one on top of it
@@ -757,9 +755,30 @@ try{
       lastR = r;
       const a = pressureAlpha(getPressure(e));
       lastAlpha = a;
+      distanceToNextDab = DAB_SPACING_BACKING;
       const verts = circleVerts(p.x, p.y, r, a);
       drawVertsIntoAcc(new Float32Array(verts), verts.length / 8, colorRgb, tool === 'eraser');
     };
+
+    function stampDabsAlong(all, p0, p1, r, alpha){
+      const dx = p1.x - p0.x, dy = p1.y - p0.y;
+      const len = Math.hypot(dx, dy);
+      if(len <= 0) return;
+      const spacing = DAB_SPACING_BACKING;
+      // Source-over blending compounds opacity where neighboring dabs
+      // overlap. Divide the requested opacity across the approximate number
+      // of dabs covering the stroke center so the finished stroke retains
+      // the opacity of one isolated dab.
+      const overlapCount = Math.max(1, (2 * r) / spacing);
+      const stampAlpha = 1 - Math.pow(1 - alpha, 1 / overlapCount);
+      let travelled = distanceToNextDab;
+      while(travelled <= len){
+        const t = travelled / len;
+        all.push.apply(all, circleVerts(p0.x + dx*t, p0.y + dy*t, r, stampAlpha));
+        travelled += spacing;
+      }
+      distanceToNextDab = travelled - len;
+    }
 
     function drawQuadCurve(all, p0, control, p1, r0, r1, alpha, steps){
       let prevPt = p0;
@@ -769,8 +788,7 @@ try{
         const x = mt*mt*p0.x + 2*mt*t*control.x + t*t*p1.x;
         const y = mt*mt*p0.y + 2*mt*t*control.y + t*t*p1.y;
         const r = r0 + (r1-r0)*t;
-        all.push.apply(all, segmentVerts(prevPt.x, prevPt.y, x, y, r, alpha));
-        all.push.apply(all, circleVerts(x, y, r, alpha));
+        stampDabsAlong(all, prevPt, {x,y}, r, alpha);
         prevPt = {x,y};
       }
       return prevPt;
@@ -792,7 +810,7 @@ try{
       lastRaw = raw;
     }
 
-    moveStroke = function(e){
+    function processStrokeBatch(e){
       if(!drawing) return;
       const t0 = performance.now();
       const events = (typeof e.getCoalescedEvents === 'function' && e.getCoalescedEvents().length)
@@ -893,32 +911,63 @@ try{
         drawVertsIntoAcc(arr, arr.length / 8, colorRgb, tool === 'eraser');
       }
       reportPerf(performance.now() - t0);
+    }
+
+    // Pointer events only collect samples. Rendering happens at most once per
+    // display frame, so coalesced mouse input is presented as one continuous
+    // curve update instead of a burst of event-timed canvas updates.
+    let pendingStrokeSamples = [];
+    let strokeFrameRAF = null;
+    function flushPendingStrokeSamples(){
+      if(strokeFrameRAF !== null){
+        cancelAnimationFrame(strokeFrameRAF);
+        strokeFrameRAF = null;
+      }
+      if(!drawing || pendingStrokeSamples.length === 0) return;
+      const samples = pendingStrokeSamples;
+      pendingStrokeSamples = [];
+      processStrokeBatch({ getCoalescedEvents(){ return samples; } });
+    }
+    moveStroke = function(e){
+      const source = (typeof e.getCoalescedEvents === 'function' && e.getCoalescedEvents().length)
+        ? e.getCoalescedEvents() : [e];
+      for(const ev of source){
+        pendingStrokeSamples.push({
+          clientX: ev.clientX,
+          clientY: ev.clientY,
+          pointerType: ev.pointerType || e.pointerType,
+          pressure: typeof ev.pressure === 'number' ? ev.pressure : e.pressure
+        });
+      }
+      if(strokeFrameRAF === null){
+        strokeFrameRAF = requestAnimationFrame(()=>{
+          strokeFrameRAF = null;
+          flushPendingStrokeSamples();
+        });
+      }
     };
 
     endStroke = function(){
       if(!drawing) return;
+      flushPendingStrokeSamples();
       drawing = false;
-      // Draw a final short curve segment out to the last raw point so the
-      // stroke doesn't end abruptly at the last midpoint. Skip this for a
-      // plain click with no movement — beginStroke already stamped the dot
-      // for that case, and stamping again here would double it up.
+      // Finish the midpoint path using the same spacing rule. This never
+      // forces a dab at the endpoint, so sub-spacing hand motion leaves the
+      // original click dab round instead of stretching it.
       if(strokeMoved && lastMid && lastRaw){
-        const r = lastR != null ? lastR : scaledBrushSize() / 2;
-        const a = lastAlpha != null ? lastAlpha : opacity;
         const all = [];
-        all.push.apply(all, segmentVerts(lastMid.x, lastMid.y, lastRaw.x, lastRaw.y, r, a));
-        // Small round cap at the tip only, sized to match the tapered
-        // stroke width — not the full brush size — so lifting the pen
-        // doesn't stamp an oversized dot at the end.
-        all.push.apply(all, circleVerts(lastRaw.x, lastRaw.y, r, a));
-        const arr = new Float32Array(all);
-        drawVertsIntoAcc(arr, arr.length / 8, colorRgb, tool === 'eraser');
+        stampDabsAlong(all, lastMid, lastRaw, lastR, lastAlpha);
+        if(all.length){
+          const arr = new Float32Array(all);
+          drawVertsIntoAcc(arr, arr.length / 8, colorRgb, tool === 'eraser');
+        }
       }
       prevRaw = null;
       lastRaw = null;
       lastMid = null;
       lastR = null;
       lastAlpha = null;
+      distanceToNextDab = 0;
       lastFedRaw = null;
       smoothBuf = [];
     };
