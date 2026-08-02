@@ -1,0 +1,1427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Canvas Studio — WASM + WebGPU</title>
+<style>
+  :root{
+    --bg:#1b1d21;
+    --panel:#232529;
+    --panel-border:#33363c;
+    --text:#e8e8ea;
+    --muted:#9a9da3;
+    --accent:#5aa9ff;
+  }
+  *{box-sizing:border-box;}
+  html,body{
+    margin:0; padding:0; height:100%;
+    background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    overflow:hidden;
+    user-select:none;
+  }
+  #app{
+    display:flex; flex-direction:column; height:100vh;
+  }
+
+  /* Top bar */
+  #topbar{
+    display:flex; align-items:center; gap:14px;
+    padding:8px 14px;
+    background:var(--panel);
+    border-bottom:1px solid var(--panel-border);
+    flex-shrink:0;
+    z-index:5;
+    flex-wrap: wrap;
+  }
+  #topbar .title{ font-weight:600; font-size:14px; color:var(--text); margin-right:8px;}
+  .group{ display:flex; align-items:center; gap:8px; padding:0 10px; border-left:1px solid var(--panel-border);}
+  .group:first-of-type{ border-left:none; }
+  label.small{ font-size:11px; color:var(--muted); }
+  button{
+    background:#2c2f34; color:var(--text); border:1px solid var(--panel-border);
+    border-radius:6px; padding:6px 10px; font-size:13px; cursor:pointer;
+  }
+  button:hover{ background:#34383e; }
+  button.active{ background:var(--accent); color:#08121f; border-color:var(--accent); }
+  input[type=color]{
+    width:30px; height:28px; border:1px solid var(--panel-border); border-radius:6px; padding:0; background:none; cursor:pointer;
+  }
+  input[type=range]{ width:100px; accent-color:var(--accent); }
+  #zoomLabel{ font-size:12px; color:var(--muted); min-width:44px; text-align:center; }
+  #gpuBadge{ font-size:11px; padding:3px 8px; border-radius:10px; border:1px solid var(--panel-border); }
+  #gpuBadge.ok{ color:#7be08a; border-color:#2c5c34; background:#173420; }
+  #gpuBadge.bad{ color:#ff8a8a; border-color:#5c2c2c; background:#341717; }
+  #perf{ font-size:11px; color:var(--muted); min-width:120px; }
+
+  /* Canvas area */
+  #stageWrap{
+    position:relative; flex:1; overflow:hidden;
+    background:
+      linear-gradient(45deg,#26282c 25%,transparent 25%),
+      linear-gradient(-45deg,#26282c 25%,transparent 25%),
+      linear-gradient(45deg,transparent 75%,#26282c 75%),
+      linear-gradient(-45deg,transparent 75%,#26282c 75%);
+    background-size:20px 20px;
+    background-position:0 0,0 10px,10px -10px,-10px 0px;
+    background-color:#1e1f22;
+    cursor:crosshair;
+    touch-action:none;
+  }
+  #stage{
+    position:absolute; top:0; left:0;
+    transform-origin:0 0;
+    box-shadow:0 0 0 1px rgba(255,255,255,0.08), 0 20px 60px rgba(0,0,0,0.5);
+    background:#ffffff;
+  }
+  canvas{ display:block; position:absolute; top:0; left:0; }
+  #sizePreview{
+    position:absolute; display:none; pointer-events:none;
+    z-index:6;
+  }
+
+  #hint{
+    position:absolute; bottom:10px; left:50%; transform:translateX(-50%);
+    background:rgba(0,0,0,0.55); padding:6px 12px; border-radius:20px;
+    font-size:11.5px; color:#d7d9dc; pointer-events:none; white-space:nowrap;
+  }
+  #fatal{
+    position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+    background:rgba(10,10,12,0.92); z-index:20; padding:40px; text-align:center;
+  }
+  #fatal.show{ display:flex; }
+  #fatal .box{ max-width:520px; }
+  #fatal h2{ margin:0 0 10px; }
+  #fatal p{ color:var(--muted); line-height:1.5; }
+  #fatal code{ background:#111; padding:2px 6px; border-radius:4px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <span class="title">Canvas Studio</span>
+    <span id="gpuBadge">checking WebGPU…</span>
+
+    <div class="group">
+      <button id="toolPen" class="active">✎ Pen</button>
+      <button id="toolEraser">🩹 Eraser</button>
+    </div>
+
+    <div class="group">
+      <label class="small">Color</label>
+      <input type="color" id="colorPicker" value="#111111">
+    </div>
+
+    <div class="group">
+      <label class="small">Size <span id="sizeVal">6</span>px</label>
+      <input type="range" id="sizeSlider" min="1" max="150" value="6">
+    </div>
+
+    <div class="group">
+      <label class="small">Opacity <span id="opVal">100</span>%</label>
+      <input type="range" id="opSlider" min="1" max="100" value="100">
+    </div>
+
+    <div class="group">
+      <label class="small">Stabilization <span id="stabVal">0</span>%</label>
+      <input type="range" id="stabSlider" min="0" max="100" value="0">
+    </div>
+
+    <div class="group">
+      <button id="undoBtn">↶ Undo</button>
+      <button id="redoBtn">↷ Redo</button>
+      <button id="clearBtn">🗑 Clear</button>
+    </div>
+
+    <div class="group">
+      <button id="zoomOutBtn">−</button>
+      <span id="zoomLabel">100%</span>
+      <button id="zoomInBtn">+</button>
+      <button id="zoomResetBtn">Reset</button>
+    </div>
+
+    <div class="group">
+      <button id="saveBtn">⬇ Save PNG</button>
+    </div>
+
+    <div class="group">
+      <span id="perf"></span>
+    </div>
+  </div>
+
+  <div id="stageWrap">
+    <div id="stage">
+      <canvas id="canvas" width="1920" height="1080"></canvas>
+    </div>
+    <canvas id="sizePreview"></canvas>
+    <div id="hint">Space + Drag to pan &nbsp;•&nbsp; Ctrl + Space + Drag to zoom &nbsp;•&nbsp; Scroll to zoom &nbsp;•&nbsp; C + Drag to resize brush &nbsp;•&nbsp; "W" to clear &nbsp;•&nbsp; "B" brush, "E" eraser &nbsp;•&nbsp; Pen pressure supported &nbsp;•&nbsp; brush = WASM, canvas = WebGPU</div>
+    <div id="fatal">
+      <div class="box">
+        <h2>WebGPU isn't available here</h2>
+        <p>This build renders strokes on the GPU via the WebGPU API. Your browser or device doesn't expose <code>navigator.gpu</code>.
+        Try the latest Chrome, Edge, or Chrome on Android (desktop Chrome/Edge 113+, or Safari 18+ with WebGPU enabled).</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script id="brush-wasm-b64" type="text/plain">AGFzbQEAAAABcRJgAABgBH19fX0AYAABf2ABfwBgAX8Bf2ACf38AYAF8AXxgA39/fQBgBH9/f38AYAZ9fX19f30AYAJ/fwF9YAJ/fwF/YAN/f34AYAF+AX9gA319fwBgBH19fX0Bf2AFfX19fX0Bf2AHfX19fX19fQF/Ag0BA2VudgVhYm9ydAAIAx0cBwMEBQUDCQoLAAwADQYGDgEAAgQCAgEBDxAAEQUDAQABBrcCLX8BQQALfwFBAAt/AUEAC38BQQALfwFBAAt/AUEAC38BQQALfwFBAAt/AUEAC38BQQALfwFBAAt/AUEAC38BQQALfwFBAAt/AUEAC38BQQALfQFDAAAAAAt9AUMAAAAAC30BQwAAAAALfQFDAAAAAAt9AUMAAAAAC30BQwAAAAALfQFDAAAAAAt9AUMAAAAAC30BQwAAAAALfQFDAAAAAAt9AUMAAAAAC30BQwAAAAALfQFDAAAAAAt9AUMAAAAAC30BQwAAAAALfQFDAACAPwt/AUEAC30BQwAAAAALfQFDAAAAAAt9AUMAAAAAC30BQwAAAAALfQFDAAAAAAt9AUMAAAAAC30BQwAAAD8LfwFBAQt8AUQAAAAAAAAAAAt8AUQAAAAAAAAAAAt+AUIAC38BQeiNAgsHVwcJZ2V0T3V0UHRyABYLYmVnaW5TdHJva2UAGglhZGRTYW1wbGUAHApiZWdpbkNoYXNlABsLaXNDaGFzZURvbmUAFQljaGFzZVN0ZXAAGQZtZW1vcnkCAAgBEgwBEAq2RBxpACMsQQRrJCwjLEHoDUgEQEGAjgJBsI4CQQFBARAAAAsjLEEANgIAIywgADYCACABIABBFGsoAhBBAnZPBEBB0ApB0AhB3QBBKRAAAAsjLCAANgIAIAAgAUECdGogAjgCACMsQQRqJCwL3AEBA38gAEUEQA8LIwcgAEEUayIAKAIEQQNxRgRAIAAjBUYEQCAAKAIIJAULAkAgACgCBEF8cSIBRQRAIAAoAggaDAELIAEgACgCCCICNgIIIAIgASACKAIEQQNxcjYCBAsjBiECIAAoAgwiAUECTQR/QQEFIAFB0A0oAgBLBEBB0ApBkAtBFUEcEAAACyABQQJ0QdQNaigCAEEgcQshAyACKAIIIQEgACMHRUECIAMbIAJyNgIEIAAgATYCCCABIAAgASgCBEEDcXI2AgQgAiAANgIIIwNBAWokAwsLWAAjLEEEayQsIyxB6A1IBEBBgI4CQbCOAkEBQQEQAAALIyxBADYCACAAQf////8ASwRAQaAIQdAIQTNBPBAAAAsjLCAAQQJ0EBQiADYCACMsQQRqJCwgAAvDAQEEfyABKAIAQXxxIgNBgAJJBH8gA0EEdgVBH0H8////AyADIANB/P///wNPGyIDZ2siBEEHayECIAMgBEEEa3ZBEHMLIQMgASgCCCEFIAEoAgQiBARAIAQgBTYCCAsgBQRAIAUgBDYCBAsgASAAIAJBBHQgA2pBAnRqIgEoAmBGBEAgASAFNgJgIAVFBEAgACACQQJ0aiIBKAIEQX4gA3dxIQMgASADNgIEIANFBEAgACAAKAIAQX4gAndxNgIACwsLC7YCAQV/IAFBBGoiBiABKAIAIgNBfHFqIgQoAgAiAkEBcQRAIAAgBBAEIAEgA0EEaiACQXxxaiIDNgIAIAEoAgBBfHEgBmoiBCgCACECCyADQQJxBEAgAUEEaygCACIBKAIAIQYgACABEAQgASAGQQRqIANBfHFqIgM2AgALIAQgAkECcjYCACAEQQRrIAE2AgAgACADQXxxIgJBgAJJBH8gAkEEdgVBH0H8////AyACIAJB/P///wNPGyICZ2siA0EHayEFIAIgA0EEa3ZBEHMLIgIgBUEEdGpBAnRqKAJgIQMgAUEANgIEIAEgAzYCCCADBEAgAyABNgIECyAAIAVBBHQgAmpBAnRqIAE2AmAgACAAKAIAQQEgBXRyNgIAIAAgBUECdGoiACAAKAIEQQEgAnRyNgIECzEAAkACQAJAAkACQAJAIABBCGsoAgAOBQABAgMEBQsPCw8LDwsgACgCABACDwsPCwALuAICAn8DfSAAIAEgBBAQIyxBBGskLCMsQegNSARAQYCOAkGwjgJBAUEBEAAACyMsQQA2AgBDAAAAACEAQwAAAAAhAUEAIQQDQCAEIw9IBEAjLCMMIgY2AgAgACAGIw4gBGpBoAFvIgcQCJIhACMsIw0iBjYCACABIAYgBxAIkiEBIARBAWohBAwBCwsgACMPsiIAlSQQIAEgAJUkESMsQQRqJCwjECIIIxIiAJMiASABlCMRIgEjEyIJkyIKIAqUkruftiIKIAVDj8L1PZS7RAAAAAAAAOg/pbYiBV4EQCAKIAWVu5v8AiEGQQEhBANAIAQgBkwEQCAAIAggAJMgBLIgBrKVIgWUkiAJIAEgCZMgBZSSIAIgAxARIARBAWohBAwBCwsFIAggASACIAMQEQsgCCQSIAEkEwtiAQF9IyxBBGskLCMsQegNSARAQYCOAkGwjgJBAUEBEAAACyMsQQA2AgAjLCAANgIAIAEgAEEUaygCEEECdk8EQEHQCkHQCEHOAEEpEAAACyAAIAFBAnRqKgIAIyxBBGokLAupAQEBfyABQYACSQRAIAFBBHYhAQUgAUH+////AUkEQCABQQFBGyABZ2t0akEBayEBCyABQR8gAWdrIgJBBGt2QRBzIQEgAkEHayECCyAAIAJBAnRqKAIEQX8gAXRxIgEEfyAAIAFoIAJBBHRqQQJ0aigCYAUgACgCAEF/IAJBAWp0cSIBBH8gACAAIAFoIgBBAnRqKAIEaCAAQQR0akECdGooAmAFQQALCwuXAQECfz8AIgFBAEwEf0EBIAFrQABBAEgFQQALBEAAC0HwjQJBADYCAEGQmgJBADYCAANAIABBF0kEQCAAQQJ0QfCNAmpBADYCBEEAIQEDQCABQRBJBEAgAEEEdCABakECdEHwjQJqQQA2AmAgAUEBaiEBDAELCyAAQQFqIQAMAQsLQfCNAkGUmgI/AKxCEIYQC0HwjQIkCQuGAQEDfyABQRNqQXBxQQRrIQEgACgCoAwiAwRAIAMgAUEQayIFRgRAIAMoAgAhBCAFIQELCyACp0FwcSABayIDQRRJBEAPCyABIARBAnEgA0EIayIDQQFycjYCACABQQA2AgQgAUEANgIIIAFBBGogA2oiA0ECNgIAIAAgAzYCoAwgACABEAULZAECfyMKIgAEQCAAEAILIwwiAARAIAAQAgsjDSIABEAgABACC0HQChACQaAIEAJBkAkQAiMEIgEoAgRBfHEhAANAIAAgAUcEQCAAKAIEGiAAQRRqEAYgACgCBEF8cSEADAELCwuuBAMKfgF/AXwgAEL///////////8Ag0I0iEKVCH0iAUI/gyEEIAFCBoenQQN0QZAMaiILKQMAIQMgCykDCCECIAspAxAhASAEQgBSBEAgAyAEhiACQsAAIAR9IgWIhCEDIAIgBIYgASAFiIQhAiABIASGIAspAxggBYiEIQELIABC/////////weDQoCAgICAgIAIhCIEQv////8PgyEFIAJC/////w+DIgYgBEIgiCIHfiACQiCIIgIgBX4gBSAGfiIFQiCIfCIGQv////8Pg3whCCACIAd+IAZCIIh8IAhCIIh8JCsgByABQiCIfiIBIAVC/////w+DIAhCIIZ8fCICIAFUrSMrIAMgBH58fCIDQgKGIAJCPoiEIgRCP4ciBSACQgKGhSECIAQgBUIBh4UiAXkhBiABIAaGIAJCwAAgBn2IhCIHQv////8PgyEBIAdCIIgiCEK0hKOLAn4gAUKitb/IDH4gAUK0hKOLAn4iCUIgiHwiCkL/////D4N8IQEgCEKitb/IDH4gCkIgiHwgAUIgiHwkKyAHukSEG3BRzJg4P6IgAiAGhrpEGC1EVPshOT+ioPwHIgIgCUL/////D4MgAUIghnwiAVatIysiB0ILiHy6JCkgB0I1hiABQguIhCACfLpEAAAAAAAA8DuiJCojKUKAgICAgICA2DwgBkI0hn0gACAEhUKAgICAgICAgIB/g4S/IgyiJCkjKiAMoiQqIANCPocgBX2nC6wHAwV8A38BfiAAvSIJQiCIpyIGQR92IQggBkH/////B3EiBkH7w6T/A00EQCAGQYCAwPIDSQRAIAAPCyAAIAAgAKIiASAAoiABIAEgAUR9/rFX4x3HPqJE1WHBGaABKr+gokSm+BARERGBP6AgASABIAGioiABRHzVz1o62eU9okTrnCuK5uVavqCioKJESVVVVVVVxb+goqAPCyAGQYCAwP8HTwRAIAAgAKEPCwJ/IAlCIIinQf////8HcSIHQfyyi4AESQRAQQEhBiAIBHwgAEQAAEBU+yH5P6AhAEF/IQYgB0H7w+T/A0cEfCAAIABEMWNiGmG00D2gIgChRDFjYhphtNA9oAUgAEQAAGAaYbTQPaAiAURzcAMuihmjO6AhACABIAChRHNwAy6KGaM7oAsFIABEAABAVPsh+b+gIQAgB0H7w+T/A0cEfCAAIABEMWNiGmG00L2gIgChRDFjYhphtNC9oAUgAEQAAGAaYbTQvaAiAURzcAMuihmju6AhACABIAChRHNwAy6KGaO7oAsLIAAkKSQqIAYMAQsgB0H7w+SJBEkEQCAHQRR2IgYgACAARIPIyW0wX+Q/op4iA0QAAEBU+yH5P6KhIgAgA0QxY2IaYbTQPaIiAqEiAb1CIIinQRR2Qf8PcWtBEEsEQCADRHNwAy6KGaM7oiAAIAAgA0QAAGAaYbTQPaIiAaEiAKEgAaGhIQIgBiAAIAKhIgG9QiCIp0EUdkH/D3FrQTFLBEAgA0TBSSAlmoN7OaIgACAAIANEAAAALooZozuiIgGhIgChIAGhoSECIAAgAqEhAQsLIAEkKSAAIAGhIAKhJCogA/wCDAELQQAgCRANIgZrIAYgCBsLIQYjKSECIyohAyAGQQFxBHwgAiACoiIAIACiIQFEAAAAAAAA8D8gAEQAAAAAAADgP6IiBKEiBUQAAAAAAADwPyAFoSAEoSAAIAAgACAARJAVyxmgAfo+okR3UcEWbMFWv6CiRExVVVVVVaU/oKIgASABoiAAIABE1DiIvun6qL2iRMSxtL2e7iE+oKJErVKcgE9+kr6goqCiIAIgA6KhoKAFIAIgAqIiACACoiEBIAIgACADRAAAAAAAAOA/oiABIAAgAER9/rFX4x3HPqJE1WHBGaABKr+gokSm+BARERGBP6AgACAAIACioiAARHzVz1o62eU9okTrnCuK5uVavqCioKKhoiADoSABRElVVVVVVcW/oqGhCyIAmiAAIAZBAnEbC+8HAwV8A38BfiAAvSIJQiCIpyIGQR92IQggBkH/////B3EiBkH7w6T/A00EQCAGQZ7BmvIDSQRARAAAAAAAAPA/DwsgACAAoiIBIAGiIQJEAAAAAAAA8D8gAUQAAAAAAADgP6IiA6EiBEQAAAAAAADwPyAEoSADoSABIAEgASABRJAVyxmgAfo+okR3UcEWbMFWv6CiRExVVVVVVaU/oKIgAiACoiABIAFE1DiIvun6qL2iRMSxtL2e7iE+oKJErVKcgE9+kr6goqCiIABEAAAAAAAAAACioaCgDwsgBkGAgMD/B08EQCAAIAChDwsCfyAJQiCIp0H/////B3EiB0H8souABEkEQEEBIQYgCAR8IABEAABAVPsh+T+gIQBBfyEGIAdB+8Pk/wNHBHwgACAARDFjYhphtNA9oCIAoUQxY2IaYbTQPaAFIABEAABgGmG00D2gIgFEc3ADLooZozugIQAgASAAoURzcAMuihmjO6ALBSAARAAAQFT7Ifm/oCEAIAdB+8Pk/wNHBHwgACAARDFjYhphtNC9oCIAoUQxY2IaYbTQvaAFIABEAABgGmG00L2gIgFEc3ADLooZo7ugIQAgASAAoURzcAMuihmju6ALCyAAJCkkKiAGDAELIAdB+8PkiQRJBEAgB0EUdiIGIAAgAESDyMltMF/kP6KeIgNEAABAVPsh+T+ioSIAIANEMWNiGmG00D2iIgKhIgG9QiCIp0EUdkH/D3FrQRBLBEAgA0RzcAMuihmjO6IgACAAIANEAABgGmG00D2iIgGhIgChIAGhoSECIAYgACACoSIBvUIgiKdBFHZB/w9xa0ExSwRAIANEwUkgJZqDezmiIAAgACADRAAAAC6KGaM7oiIBoSIAoSABoaEhAiAAIAKhIQELCyABJCkgACABoSACoSQqIAP8AgwBC0EAIAkQDSIGayAGIAgbCyEGIykhASMqIQIgBkEBcQR8IAEgAaIiACABoiEDIAEgACACRAAAAAAAAOA/oiADIAAgAER9/rFX4x3HPqJE1WHBGaABKr+gokSm+BARERGBP6AgACAAIACioiAARHzVz1o62eU9okTrnCuK5uVavqCioKKhoiACoSADRElVVVVVVcW/oqGhBSABIAGiIgMgA6IhBEQAAAAAAADwPyADRAAAAAAAAOA/oiIAoSIFRAAAAAAAAPA/IAWhIAChIAMgAyADIANEkBXLGaAB+j6iRHdRwRZswVa/oKJETFVVVVVVpT+goiAEIASiIAMgA0TUOIi+6fqovaJExLG0vZ7uIT6gokStUpyAT36SvqCioKIgASACoqGgoAsiAJogACAGQQFqQQJxGwucAQAjLEEEayQsIyxB6A1IBEBBgI4CQbCOAkEBQQEQAAALIyxBADYCACMPIAJIBEAjLCMMIgI2AgAgAiMOIw9qQaABbyAAEAEjLCMNIgI2AgAgAiMOIw9qQaABbyABEAEjD0EBaiQPBSMsIwwiAjYCACACIw4gABABIywjDSICNgIAIAIjDiABEAEjDkEBakGgAW8kDgsjLEEEaiQsC4ICAgF/Cn0jFiQUIxckFSMYJBYjGSQXIxokGCMbJBkgACQaIAEkGyMXIgojGSILWyMWIgAjGCIBW3EEQA8LIAAgASMUk0MAAMBAlZIhBSAKIAsjFZNDAADAQJWSIQYgASMaIACTQwAAwECVkyEHIAsjGyAKk0MAAMBAlZMhCEEBIQQDQCAEQQZMBEBDAACAPyAEskMAAMBAlSIMkyINIA2UIA2UIgkgAJQgDUMAAEBAlCIOIA2UIAyUIg0gBZSSIA4gDJQgDJQiDiAHlJIgDCAMlCAMlCIMIAGUkiAJIAqUIA0gBpSSIA4gCJSSIAwgC5SSIAIgAxAXIARBAWohBAwBCwsLbAA/AEEQdEHojQJrQQF2JAFBhApBgAo2AgBBiApBgAo2AgBBgAokBEGkCkGgCjYCAEGoCkGgCjYCAEGgCiQGQbQLQbALNgIAQbgLQbALNgIAQbALJAhBgMABEAMkCkGgARADJAxBoAEQAyQNC7cDAQN/AkACQAJAAkAjAg4DAAECAwtBASQCQQAkAxAMIwYkBSMDDwsjB0UhASMFKAIEQXxxIQADQCAAIwZHBEAgACQFIAEgACgCBCICQQNxRwRAIAAgAkF8cSABcjYCBEEAJAMgAEEUahAGIwMPCyAAKAIEQXxxIQAMAQsLQQAkAxAMIwYjBSgCBEF8cUYEQCMsIQADQCAAQeiNAkkEQCAAKAIAEAIgAEEEaiEADAELCyMFKAIEQXxxIQADQCAAIwZHBEAgASAAKAIEIgJBA3FHBEAgACACQXxxIAFyNgIEIABBFGoQBgsgACgCBEF8cSEADAELCyMIIQAjBiQIIAAkBiABJAcgACgCBEF8cSQFQQIkAgsjAw8LIwUiACMGRwRAIAAoAgRBfHEkBSAAQeiNAkkEQCAAQQA2AgQgAEEANgIIBSMAIAAoAgBBfHFBBGprJAAgAEEEaiIAQeiNAk8EQCMJRQRAEAoLIABBBGshASAAQQ9xQQEgABsEf0EBBSABKAIAQQFxCxogASABKAIAQQFyNgIAIwkgARAFCwtBCg8LIwYjBjYCBCMGIwY2AghBACQCC0EAC4AEAQV/IABB7P///wNPBEBBkAlB0AlBhQJBHxAAAAsjACMBTwRAAkBBgBAhAQNAIAEQE2shASMCRQRAIwBBAXRBgAhqJAEMAgsgAUEASg0ACyMAIwAjAWtBgAhJQQp0aiQBCwsjCUUEQBAKCyMJIQIgAEEQaiIBQfz///8DSwRAQZAJQeALQc0DQR0QAAALIAIgAUEMTQR/QQwFIAFBE2pBcHFBBGsLIgQQCSIBRQRAIARBgAJPBH8gBEH+////AUkEfyAEQQFBGyAEZ2t0akEBawUgBAsFIAQLQQQgAigCoAw/ACIBQRB0QQRrR3RqQf//A2pBgIB8cUEQdiEDIAEgAyABIANKG0AAQQBIBEAgA0AAQQBIBEAACwsgAiABQRB0PwCsQhCGEAsgAiAEEAkhAQsgASgCABogAiABEAQgASgCACIDQXxxIARrIgVBEE8EQCABIAQgA0ECcXI2AgAgAUEEaiAEaiIDIAVBBGtBAXI2AgAgAiADEAUFIAEgA0F+cTYCACABQQRqIAEoAgBBfHFqIgIgAigCAEF9cTYCAAsgAUEENgIMIAEgADYCECMIIgIoAgghAyABIAIjB3I2AgQgASADNgIIIAMgASADKAIEQQNxcjYCBCACIAE2AggjACABKAIAQXxxQQRqaiQAIAFBFGoiAUEAIAD8CwAgAQsEACMoCwQAIwoL7AcCA38IfSMsQQRrJCwjLEHoDUgEQEGAjgJBsI4CQQFBARAAAAsjLEEANgIAIyAEfSAAIxyTIgcgB5QgASMdkyIIIAiUkruftiIJQxe30TheBH0gByAJlSEHIAggCZUFIAgLjAUjHyEHIx4LIQgjIARAIwtBBmpBgCBKBEAjLEEEaiQsDwsjHCMeIAJDAAAAP5QiCZQiCpMhCyMdIx8gCZQiDJMhDSMdIAySIQwjLCMKIgQ2AgAgBCMLQQZsIgQjHCAKkhABIywjCiIFNgIAIAUgBEEBaiAMEAEjLCMKIgU2AgAgBSAEQQJqQwAAAAAQASMsIwoiBTYCACAFIARBA2pDAAAAABABIywjCiIFNgIAIAUgBEEEaiADEAEjLCMKIgU2AgAgBSAEQQVqIAIQASMsIwoiBTYCACAFIARBBmoiBSALEAEjLCMKIgY2AgAgBiAFQQFqIA0QASMsIwoiBjYCACAGIAVBAmpDAAAAABABIywjCiIGNgIAIAYgBUEDakMAAAAAEAEjLCMKIgY2AgAgBiAFQQRqIAMQASMsIwoiBjYCACAGIAVBBWogAhABIywjCiIFNgIAIAUgBEEMaiIFIAAgCCAJlCIKkiIMEAEjLCMKIgY2AgAgBiAFQQFqIAEgByAJlCIJkiIOEAEjLCMKIgY2AgAgBiAFQQJqQwAAAAAQASMsIwoiBjYCACAGIAVBA2pDAAAAABABIywjCiIGNgIAIAYgBUEEaiADEAEjLCMKIgY2AgAgBiAFQQVqIAIQASMsIwoiBTYCACAFIARBEmoiBSALEAEjLCMKIgY2AgAgBiAFQQFqIA0QASMsIwoiBjYCACAGIAVBAmpDAAAAABABIywjCiIGNgIAIAYgBUEDakMAAAAAEAEjLCMKIgY2AgAgBiAFQQRqIAMQASMsIwoiBjYCACAGIAVBBWogAhABIywjCiIFNgIAIAUgBEEYaiIFIAAgCpMQASMsIwoiBjYCACAGIAVBAWogASAJkxABIywjCiIGNgIAIAYgBUECakMAAAAAEAEjLCMKIgY2AgAgBiAFQQNqQwAAAAAQASMsIwoiBjYCACAGIAVBBGogAxABIywjCiIGNgIAIAYgBUEFaiACEAEjLCMKIgU2AgAgBSAEQR5qIgQgDBABIywjCiIFNgIAIAUgBEEBaiAOEAEjLCMKIgU2AgAgBSAEQQJqQwAAAAAQASMsIwoiBTYCACAFIARBA2pDAAAAABABIywjCiIFNgIAIAUgBEEEaiADEAEjLCMKIgU2AgAgBSAEQQVqIAIQASMLQQZqJAsLIAAkHCABJB0gCCQeIAckH0EBJCAjLEEEaiQsC9MEAwV/AXwCfSMsQQRrJCwjLEHoDUgEQEGAjgJBsI4CQQFBARAAAAsjLEEANgIAIwtBGGpBgCBKBEAjLEEEaiQsDwsgAkMAAAA/lCECIwtBBmwhBQNAIARBCEgEQCMsIwoiBjYCACAGIAUgBEESbGoiBiAAEAEjLCMKIgc2AgAgByAGQQFqIAEQASMsIwoiBzYCACAHIAZBAmpDAAAAABABIywjCiIHNgIAIAcgBkEDakMAAAAAEAEjLCMKIgc2AgAgByAGQQRqIAMQASMsIwoiBzYCACAHIAZBBWpDAAAAABABIAAgBLJD2w/JQJRDAAAAPpS7IgkQD7YgApSSIQogASAJEA62IAKUkiELIywjCiIHNgIAIAcgBkEGaiIHIAoQASMsIwoiCDYCACAIIAdBAWogCxABIywjCiIINgIAIAggB0ECakMAAAAAEAEjLCMKIgg2AgAgCCAHQQNqQwAAAAAQASMsIwoiCDYCACAIIAdBBGogAxABIywjCiIINgIAIAggB0EFakMAAAAAEAEgACAEQQFqIgSyQ9sPyUCUQwAAAD6UuyIJEA+2IAKUkiEKIAEgCRAOtiAClJIhCyMsIwoiBzYCACAHIAZBDGoiBiAKEAEjLCMKIgc2AgAgByAGQQFqIAsQASMsIwoiBzYCACAHIAZBAmpDAAAAABABIywjCiIHNgIAIAcgBkEDakMAAAAAEAEjLCMKIgc2AgAgByAGQQRqIAMQASMsIwoiBzYCACAHIAZBBWpDAAAAABABDAELCyMLQRhqJAsjLEEEaiQsC4UEAwJ/AnwDfUEAJAsjKARAQQAPC0ECIABDAACwQZS7RAAAAAAAAABAoCIGmyIHIAdEAAAAAAAA8L+gIAdEAAAAAAAA4L+gIAZlG/wCIgQgBEECSBuyQwAAgD9DAACAQEMAAIA/IAOVIgggCEMAAIBAXhsgCEMAAIA/XRuUuyIGmyIHIAdEAAAAAAAA8L+gIAdEAAAAAAAA4L+gIAZlG/wCIgRBAkgEQEECIQQLQaABIAQgBEGgAUobIQVDAAAAPyABQwAAAABDAACAPyMnIgggCEMAAIA/XhsgCEMAAAAAXRsiCCAIlEMAAEBAIAggCJKTlEMfhWs/lEMK16M9kpQiCCAIQwAAAD9dGyEIIAJDAAAAAEMAAIA/IyciAiACQwAAgD9eGyACQwAAAABdGyICIAKUQwAAQEAgAiACkpOUQ4XrUT+UQ+xROD6SlCEJIyMjIZMiCiAKlCMkIyKTIgIgApSSu5+2Q83MzD5dBEBBACEEA0AgBEEDSARAIyMjJCAIIAkgBSABEAcgBEEBaiEEDAELC0EBJCgjCw8LIyEgCkQAAAAAAADgPyAAQ2Zm5j6Uu6FEmpmZmZmZqT+ltkMAAIA/QwAAgEBDAACAPyADlSIAIABDAACAQF4bIABDAACAP10blSIAlJIkISMiIAIgAJSSJCIjISMiIAggCSAFIAEQByMLC9EBAEEAJAtBACQOQQAkD0EAJCAgACQhIAEkIiAAJCMgASQkIAAkJSABJCYgAiQnIAAkEiABJBMgACQUIAEkFSAAJBYgASQXIAAkGCABJBkgACQaIAEkGyAAIAFBAhAQQQEkKCAAIAFDAAAAPyADQwAAAABDAACAPyACIAJDAACAP14bIAJDAAAAAF0bIgAgAJRDAABAQCAAIACSkyIBlEMfhWs/lEMK16M9kpQiAiACQwAAAD9dGyAEIAAgAJQgAZRDhetRP5RD7FE4PpKUEBgjCwsGAEEAJCgLzgMDAX8CfAF9QQAkCyAAJCMgASQkIAAjJZMiCiAKlCABIyaTIgogCpSSu5+2Q83MzD4gBpVdBEBBAA8LIAAkJSABJCYjISAAIyGTRAAAAAAAAOA/IANDZmbmPpS7oUSamZmZmZmpP6W2QwAAgD9DAACAQEMAAIA/IAaVIgAgAEMAAIBAXhsgAEMAAIA/XRsiAJUiBpSSJCEjIiABIyKTIAaUkiQiIycgAiMnk0MzM7M+lJIkJ0ECIANDAACwQZS7RAAAAAAAAABAoCIImyIJIAlEAAAAAAAA8L+gIAlEAAAAAAAA4L+gIAhlG/wCIgcgB0ECSBuyIACUuyIImyIJIAlEAAAAAAAA8L+gIAlEAAAAAAAA4L+gIAhlG/wCIgdBAkgEQEECIQcLIyEjIkMAAAA/IARDAAAAAEMAAIA/IyciASABQwAAgD9eGyABQwAAAABdGyIBIAGUQwAAQEAgASABkpOUQx+Faz+UQwrXoz2SlCIBIAFDAAAAP10bIAVDAAAAAEMAAIA/IyciASABQwAAgD9eGyABQwAAAABdGyIBIAGUQwAAQEAgASABkpOUQ4XrUT+UQ+xROD6SlEGgASAHIAdBoAFKGyAEEAcjCwsL0AQQAEGMCAsBLABBmAgLIwIAAAAcAAAASQBuAHYAYQBsAGkAZAAgAGwAZQBuAGcAdABoAEG8CAsBPABByAgLLQIAAAAmAAAAfgBsAGkAYgAvAHMAdABhAHQAaQBjAGEAcgByAGEAeQAuAHQAcwBB/AgLATwAQYgJCy8CAAAAKAAAAEEAbABsAG8AYwBhAHQAaQBvAG4AIAB0AG8AbwAgAGwAYQByAGcAZQBBvAkLATwAQcgJCycCAAAAIAAAAH4AbABpAGIALwByAHQALwBpAHQAYwBtAHMALgB0AHMAQbwKCwE8AEHICgsrAgAAACQAAABJAG4AZABlAHgAIABvAHUAdAAgAG8AZgAgAHIAYQBuAGcAZQBB/AoLASwAQYgLCxsCAAAAFAAAAH4AbABpAGIALwByAHQALgB0AHMAQcwLCwE8AEHYCwslAgAAAB4AAAB+AGwAaQBiAC8AcgB0AC8AdABsAHMAZgAuAHQAcwBBkAwLwAFug/miAAAAANFXJ/wpFUROmZVi28DdNPWrY1H+QZBDPDpuJLdhxbve6i5JBuDSTUIc6x3+HJLRCfU1gug+pymxJnCc6YREuy451pE5QX5ftItfhJz0OVOD/5f4Hzso+b2LES/vD5gF3s9+Nm0fbQpaZj9GT7cJyyfHuid1Lepfnvc5Bz178eXrsV/7a+qSUopGMANWCF2NHyC8z/Cra3v8YZHjqR029JpfhZllCBvmXoDY/41AaKAUVxUGBjEnc00AQdANCxYFAAAAIAAAACAAAAAgAAAAAAAAACQZACIQc291cmNlTWFwcGluZ1VSTBAuL2JydXNoLndhc20ubWFw
+</script>
+<script>
+(async function(){
+const gpuBadge = document.getElementById('gpuBadge');
+const fatal = document.getElementById('fatal');
+try{
+  const canvas = document.getElementById('canvas');
+  const stage = document.getElementById('stage');
+  const stageWrap = document.getElementById('stageWrap');
+  const sizePreview = document.getElementById('sizePreview');
+  const sizePreviewCtx = sizePreview.getContext('2d');
+  const perfEl = document.getElementById('perf');
+
+  const W = 1920, H = 1080;
+  const SS = 4; // backing-store supersample factor — higher means more samples per screen pixel, i.e. stronger antialiasing
+  const BW = W * SS, BH = H * SS;
+
+  canvas.width = BW; canvas.height = BH;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  stage.style.width = W + 'px';
+  stage.style.height = H + 'px';
+
+  function withTimeout(promise, ms, label){
+    return Promise.race([
+      promise,
+      new Promise((_, rej) => setTimeout(() => rej(new Error(
+        label + ' timed out (' + (ms/1000) + 's)'
+      )), ms))
+    ]);
+  }
+
+  // ---------- WebGPU bring-up (falls back to Canvas2D if unavailable) ----------
+  let useWebGPU = !!navigator.gpu;
+  let device, context, format;
+  let gpuFailReason = null;
+
+  if(useWebGPU){
+    try{
+      console.log('[CanvasStudio] requesting adapter...');
+      const adapter = await withTimeout(
+        navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }),
+        5000, 'requestAdapter()'
+      );
+      console.log('[CanvasStudio] adapter:', adapter);
+      if(!adapter) throw new Error('requestAdapter() returned null — no compatible GPU adapter found');
+      console.log('[CanvasStudio] requesting device...');
+      device = await withTimeout(adapter.requestDevice(), 5000, 'requestDevice()');
+      console.log('[CanvasStudio] device:', device);
+      context = canvas.getContext('webgpu');
+      console.log('[CanvasStudio] context:', context);
+      if(!context) throw new Error("canvas.getContext('webgpu') returned null");
+      format = navigator.gpu.getPreferredCanvasFormat();
+      console.log('[CanvasStudio] format:', format, '— configuring...');
+      context.configure({ device, format, alphaMode: 'opaque' });
+      console.log('[CanvasStudio] configured OK');
+    }catch(err){
+      console.warn('WebGPU unavailable, falling back to Canvas2D:', err);
+      gpuFailReason = err.message;
+      useWebGPU = false;
+    }
+  } else {
+    gpuFailReason = 'navigator.gpu is not present in this browser';
+  }
+
+  if(useWebGPU){
+    gpuBadge.textContent = 'WebGPU active';
+    gpuBadge.className = 'ok';
+  } else {
+    gpuBadge.textContent = 'Software 2D mode (WebGPU unavailable)';
+    gpuBadge.title = gpuFailReason || '';
+    gpuBadge.className = 'bad';
+  }
+
+  // ---------- App state (engine-agnostic) ----------
+  let tool = 'pen';
+  let color = '#111111';
+  function hexToRgb(hex){
+    const v = parseInt(hex.slice(1), 16);
+    return [((v>>16)&255)/255, ((v>>8)&255)/255, (v&255)/255];
+  }
+  let colorRgb = hexToRgb(color);
+  // Each tool remembers its own brush size independently — switching from
+  // pen to eraser and back doesn't clobber either one's size.
+  const toolSizes = { pen: 6, eraser: 6 };
+  function getBrushSize(){ return toolSizes[tool]; }
+  function setBrushSize(v){ toolSizes[tool] = v; }
+  let opacity = 1;
+  let stabilization = 0;
+
+  let zoom = 1;
+  let panX = 0, panY = 0;
+
+  let spaceDown = false;
+  let ctrlDown = false;
+  let cDown = false;
+  let isSizeDragging = false;
+  let sizeDragStart = null;
+  let isPanning = false;
+  let isZoomDragging = false;
+  let panStart = null;
+  let zoomDragStart = null;
+
+  let drawing = false;
+  let activePointerId = null; // the pointerId currently owning the in-progress stroke
+  let hoverX = null, hoverY = null; // last known pointer position (wrap-relative), for the brush preview
+  let hoverPressure = 1; // last known hover pressure (pen: 0 when not touching), for the brush preview
+  let hovering = false;
+  let chaseRAF = null;
+  const undoStack = [];
+  const redoStack = [];
+  const MAX_UNDO = 12;
+
+  // simple perf readout: rolling average of ms spent per pointermove batch
+  let perfSamples = [];
+  function reportPerf(ms){
+    perfSamples.push(ms);
+    if(perfSamples.length > 30) perfSamples.shift();
+    const avg = perfSamples.reduce((a,b)=>a+b,0) / perfSamples.length;
+    perfEl.textContent = avg.toFixed(2) + ' ms/batch';
+  }
+
+  function fitToScreen(){
+    const wrapRect = stageWrap.getBoundingClientRect();
+    const scale = Math.min((wrapRect.width - 80) / W, (wrapRect.height - 80) / H, 1);
+    zoom = scale > 0 ? scale : 1;
+    panX = (wrapRect.width - W*zoom)/2;
+    panY = (wrapRect.height - H*zoom)/2;
+    applyTransform();
+  }
+
+  function applyTransform(){
+    stage.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+    document.getElementById('zoomLabel').textContent = Math.round(zoom*100) + '%';
+    // The canvas is a fixed-resolution backing store scaled up/down purely
+    // via this CSS transform, so the browser is the one deciding how to
+    // resample it. Past this zoom threshold we switch to nearest-neighbor
+    // ("pixelated") so you see the backing store's actual antialiased
+    // texels as crisp blocks — like the classic "zoomed into a raster line"
+    // reference — instead of the browser smearing them into a photographic
+    // blur. Below the threshold, smooth bilinear interpolation looks right.
+    canvas.style.imageRendering = zoom >= 3.01 ? 'pixelated' : 'auto';
+    if(typeof updateBrushPreview === 'function') updateBrushPreview();
+  }
+
+  function screenToCanvas(clientX, clientY){
+    // Returns coordinates in the backing-store (supersampled) pixel space.
+    const wrapRect = stageWrap.getBoundingClientRect();
+    const x = ((clientX - wrapRect.left - panX) / zoom) * SS;
+    const y = ((clientY - wrapRect.top - panY) / zoom) * SS;
+    return {x, y};
+  }
+
+  // pointermove events fire based on screen-space movement, not canvas-space
+  // movement. Zoomed out, the same hand motion covers much more canvas
+  // distance per real sample (screenToCanvas divides by zoom), so any fixed
+  // amount of device-pixel noise gets amplified by 1/zoom once it lands in
+  // canvas space. Ported from draw.html, which doesn't show this wobble:
+  // scale smoothing/deadzone by this factor (capped so it doesn't run away
+  // at extreme zoom-out) to keep the *screen-space* noise budget constant.
+  function zoomSmoothingFactor(){
+    return Math.min(4, Math.max(1, 1 / zoom));
+  }
+
+  function getPressure(e){
+    if(e.pointerType === 'pen' && typeof e.pressure === 'number' && e.pressure > 0){
+      return e.pressure;
+    }
+    if(e.pointerType === 'mouse') return 1;
+    return e.pressure || 1;
+  }
+
+  // Pressure to use for the hover PREVIEW specifically. This is deliberately
+  // different from getPressure() above: while actually drawing, a pen
+  // reporting 0 pressure basically can't happen (it means tip contact with
+  // zero force, vs. "not touching yet"), so getPressure() safely falls back
+  // to 1. But while hovering — tip above the digitizer, not touching — pens
+  // genuinely report pressure 0, and that's exactly the case we want the
+  // preview to show: a mouse always previews at full size (it has no
+  // pressure concept), but a hovering pen should preview small/near-zero
+  // and grow as it's pressed down, giving a real look-ahead of what the
+  // next dab's size will actually be.
+  function getHoverPressure(e){
+    if(e.pointerType === 'pen' && typeof e.pressure === 'number') return e.pressure;
+    return 1;
+  }
+  // Pressure -> visual weight, ported from the reference app's approach.
+  //
+  // A plain linear map (radius = floor + (full-floor)*pressure) turns out to
+  // be the real reason light pressure still looked heavy: most styli have an
+  // activation threshold, so the "lightest possible touch" the browser
+  // actually reports is rarely near 0 — it's commonly already 0.3-0.4. Fed
+  // straight into a linear map, that's already a third of the way to full
+  // size/opacity before the stroke can look faint at all.
+  //
+  // The fix is a CURVE, not a smaller floor: remap raw pressure through a
+  // "hard" response that stays low through most of the 0-1 range and only
+  // ramps up to full size near the very top of the pressure range. That way
+  // a real device's "light touch" (even if it reports ~0.35) still lands in
+  // the curve's flat low region and comes out thin, while a firm press still
+  // reaches full size. This is a cubic Bezier in "pressure in -> weight out"
+  // space; control points chosen to match the reference app's `hard` preset.
+  const PRESSURE_CURVE_HARD = [[0,1],[0.3,0.85],[0.7,0.4],[1,0]];
+  function bezierPointAt(pts, t){
+    const [p0,p1,p2,p3] = pts, mt = 1 - t;
+    const x = mt*mt*mt*p0[0] + 3*mt*mt*t*p1[0] + 3*mt*t*t*p2[0] + t*t*t*p3[0];
+    const y = mt*mt*mt*p0[1] + 3*mt*mt*t*p1[1] + 3*mt*t*t*p2[1] + t*t*t*p3[1];
+    return [x, y];
+  }
+  function pressureInfluence(pressure){
+    const p = Math.max(0, Math.min(1, pressure == null ? 1 : pressure));
+    // Binary-search the Bezier's parameter t for the given input pressure x,
+    // then read off y at that t (curve x is monotonic, so this converges).
+    let lo = 0, hi = 1;
+    for(let i = 0; i < 24; i++){
+      const mid = (lo + hi) / 2;
+      if(bezierPointAt(PRESSURE_CURVE_HARD, mid)[0] < p) lo = mid; else hi = mid;
+    }
+    const y = bezierPointAt(PRESSURE_CURVE_HARD, (lo + hi) / 2)[1];
+    return Math.max(0, Math.min(1, 1 - y)); // curve stores y=0 as "max", flip to normal 0..1 influence
+  }
+
+  // Minimum-size floor as a PERCENTAGE of the brush's own full size (matches
+  // the reference app's default 5%), not a fixed pixel amount — the curve
+  // above is what keeps light pressure thin, not this floor. A separate tiny
+  // absolute floor further down just stops the radius from hitting literal
+  // zero.
+  const MIN_SIZE_PERCENT = 0.05;
+  const MIN_ABS_RADIUS_BACKING = 0.1 * SS; // never fully vanish
+  function pressureRadius(size, pressure){
+    const full = (size * SS) / 2;
+    const influence = pressureInfluence(pressure);
+    const minR = full * MIN_SIZE_PERCENT;
+    const r = minR + (full - minR) * influence;
+    return Math.max(MIN_ABS_RADIUS_BACKING, r);
+  }
+
+  // Alpha follows the SAME curve/influence as radius, so width and darkness
+  // taper in lockstep — no fixed alpha floor beyond a tiny anti-invisibility
+  // clamp, so a genuinely light touch can look genuinely faint.
+  const MIN_ALPHA = 0.02;
+  function pressureAlpha(pressure){
+    const influence = pressureInfluence(pressure);
+    return Math.max(MIN_ALPHA, opacity * influence);
+  }
+
+  const scaledBrushSize = () => getBrushSize() * SS;
+
+  // These get assigned by whichever engine (WebGPU or Canvas2D) initializes below.
+  let pushUndo, restore, beginStroke, moveStroke, endStroke, clearCanvas;
+
+  if(useWebGPU){
+    // ================= WebGPU + WASM brush engine =================
+    const wasmB64 = document.getElementById('brush-wasm-b64').textContent.trim();
+    const wasmBytes = Uint8Array.from(atob(wasmB64), c => c.charCodeAt(0));
+    console.log('[CanvasStudio] instantiating WASM brush, bytes:', wasmBytes.length);
+    const { instance: wasmInstance } = await WebAssembly.instantiate(wasmBytes, {
+      env: { abort(){ throw new Error('wasm abort'); } }
+    });
+    console.log('[CanvasStudio] WASM instantiated OK');
+    const brush = wasmInstance.exports;
+
+    function readVerts(vertCount){
+      const ptr = brush.getOutPtr();
+      return new Float32Array(brush.memory.buffer, ptr, vertCount * 6);
+    }
+
+    // ---------- GPU resources ----------
+    // Every stamp (round dab OR the straight capsule between two dabs) is
+    // sent down as a plain bounding-box quad carrying the TRUE shape
+    // parameters (p0, p1, r) as per-vertex attributes. The fragment shader
+    // computes the exact signed distance from that fragment to the real
+    // capsule (a dab is just a zero-length capsule, p0 == p1) and turns it
+    // into coverage with a fwidth()-sized step.
+    //
+    // This replaces the old approach of manually extruding an outline
+    // polygon by a fixed feather width and linearly interpolating a
+    // "coverage" value across it. That worked for a single isolated shape,
+    // but a stroke is hundreds of overlapping dabs+capsules stamped one on
+    // top of the other, each contributing its own ~1px feather ring; where
+    // those rings stacked along the curve of the stroke the blended result
+    // read as a much wider, mushy gradient than any single shape's feather
+    // — the "way too blurry" edge. Computing distance analytically per
+    // fragment means every dab's edge is exactly as sharp as every other
+    // dab's, and it can't compound: a fragment is only ever affected by the
+    // ~1-pixel band around its own true boundary, regardless of how many
+    // other dabs happen to overlap nearby.
+    const strokeShader = device.createShaderModule({ code: `
+      struct Uniforms {
+        size: vec2f,
+        color: vec3f,
+        mode: f32,
+      };
+      @group(0) @binding(0) var<uniform> u: Uniforms;
+
+      struct VSOut {
+        @builtin(position) pos: vec4f,
+        @location(0) p0: vec2f,
+        @location(1) p1: vec2f,
+        @location(2) r: f32,
+        @location(3) alpha: f32,
+      };
+
+      @vertex
+      fn vs(
+        @location(0) position: vec2f,
+        @location(1) p0: vec2f,
+        @location(2) p1: vec2f,
+        @location(3) r: f32,
+        @location(4) alpha: f32
+      ) -> VSOut {
+        var out: VSOut;
+        let ndc = vec2f(
+          (position.x / u.size.x) * 2.0 - 1.0,
+          1.0 - (position.y / u.size.y) * 2.0
+        );
+        out.pos = vec4f(ndc, 0.0, 1.0);
+        out.p0 = p0;
+        out.p1 = p1;
+        out.r = r;
+        out.alpha = alpha;
+        return out;
+      }
+
+      // Distance from p to the segment a-b (0 when a == b, i.e. a round dab).
+      fn sdSegment(p: vec2f, a: vec2f, b: vec2f) -> f32 {
+        let pa = p - a;
+        let ba = b - a;
+        let denom = dot(ba, ba);
+        let h = select(clamp(dot(pa, ba) / denom, 0.0, 1.0), 0.0, denom < 1e-6);
+        return length(pa - ba * h);
+      }
+
+      @fragment
+      fn fs(in: VSOut) -> @location(0) vec4f {
+        let eraseColor = vec3f(1.0, 1.0, 1.0);
+        let rgb = select(u.color, eraseColor, u.mode > 0.5);
+        // @builtin(position).xy is the fragment's exact backing-store pixel
+        // coordinate, so we can measure real distance-to-shape right here.
+        let d = sdSegment(in.pos.xy, in.p0, in.p1) - in.r;
+        // fwidth(d) is how much d changes per screen pixel at this
+        // fragment — using it as the step width keeps the edge a crisp,
+        // constant ~1px transition at any zoom or supersample factor,
+        // instead of a fixed constant that can end up too wide.
+        let aa = max(fwidth(d), 1e-4);
+        let cov = clamp(0.5 - d / aa, 0.0, 1.0);
+        return vec4f(rgb, in.alpha * cov);
+      }
+    `});
+
+    const strokePipeline = device.createRenderPipeline({
+      layout: 'auto',
+      vertex: {
+        module: strokeShader, entryPoint: 'vs',
+        buffers: [{
+          arrayStride: 32,
+          attributes: [
+            { format: 'float32x2', offset: 0,  shaderLocation: 0 }, // position (quad corner)
+            { format: 'float32x2', offset: 8,  shaderLocation: 1 }, // p0
+            { format: 'float32x2', offset: 16, shaderLocation: 2 }, // p1
+            { format: 'float32',   offset: 24, shaderLocation: 3 }, // r
+            { format: 'float32',   offset: 28, shaderLocation: 4 }, // alpha
+          ]
+        }]
+      },
+      fragment: {
+        module: strokeShader, entryPoint: 'fs',
+        targets: [{
+          format: 'rgba8unorm',
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'zero', operation: 'add' },
+          }
+        }]
+      },
+      primitive: { topology: 'triangle-list' },
+    });
+
+    const strokeUniformBuf = device.createBuffer({
+      size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    const strokeBindGroup = device.createBindGroup({
+      layout: strokePipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: strokeUniformBuf } }]
+    });
+
+    let vertexBuf = device.createBuffer({
+      size: 4 * 1024 * 1024, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+    });
+    function ensureVertexCapacity(bytesNeeded){
+      if(bytesNeeded <= vertexBuf.size) return;
+      vertexBuf.destroy();
+      let sz = vertexBuf.size;
+      while(sz < bytesNeeded) sz *= 2;
+      vertexBuf = device.createBuffer({ size: sz, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    }
+
+    function makeAccTex(){
+      return device.createTexture({
+        size: [BW, BH], format: 'rgba8unorm',
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING |
+               GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST,
+      });
+    }
+    let accTex = makeAccTex();
+
+    function clearTexToWhite(tex){
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{ view: tex.createView(), loadOp: 'clear', storeOp: 'store', clearValue: {r:1,g:1,b:1,a:1} }]
+      });
+      pass.end();
+      device.queue.submit([enc.finish()]);
+    }
+    clearTexToWhite(accTex);
+
+    const blitShader = device.createShaderModule({ code: `
+      struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+      @vertex
+      fn vs(@builtin(vertex_index) i: u32) -> VSOut {
+        var p = array<vec2f,3>(vec2f(-1.0,-1.0), vec2f(3.0,-1.0), vec2f(-1.0,3.0));
+        var out: VSOut;
+        out.pos = vec4f(p[i], 0.0, 1.0);
+        out.uv = vec2f((p[i].x + 1.0) * 0.5, 1.0 - (p[i].y + 1.0) * 0.5);
+        return out;
+      }
+      @group(0) @binding(0) var samp: sampler;
+      @group(0) @binding(1) var tex: texture_2d<f32>;
+      @fragment
+      fn fs(in: VSOut) -> @location(0) vec4f {
+        return vec4f(textureSample(tex, samp, in.uv).rgb, 1.0);
+      }
+    `});
+    const blitPipeline = device.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module: blitShader, entryPoint: 'vs' },
+      fragment: { module: blitShader, entryPoint: 'fs', targets: [{ format }] },
+      primitive: { topology: 'triangle-list' },
+    });
+    const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+    function makeBlitBindGroup(tex){
+      return device.createBindGroup({
+        layout: blitPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: sampler },
+          { binding: 1, resource: tex.createView() },
+        ]
+      });
+    }
+    let blitBindGroup = makeBlitBindGroup(accTex);
+
+    function present(){
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: {r:1,g:1,b:1,a:1} }]
+      });
+      pass.setPipeline(blitPipeline);
+      pass.setBindGroup(0, blitBindGroup);
+      pass.draw(3);
+      pass.end();
+      device.queue.submit([enc.finish()]);
+    }
+    present(); // paint the initial white canvas right away — otherwise nothing
+               // is drawn to the visible <canvas> until the first stroke
+
+    function drawVertsIntoAcc(floatArr, vertCount, colorRgbArr, isEraser){
+      if(vertCount <= 0) return;
+      const bytesNeeded = vertCount * 32;
+      ensureVertexCapacity(bytesNeeded);
+      device.queue.writeBuffer(vertexBuf, 0, floatArr.buffer, floatArr.byteOffset, vertCount * 8 * 4);
+
+      const uniforms = new Float32Array([BW, BH, colorRgbArr[0], colorRgbArr[1], colorRgbArr[2], isEraser ? 1 : 0, 0, 0]);
+      device.queue.writeBuffer(strokeUniformBuf, 0, uniforms);
+
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{ view: accTex.createView(), loadOp: 'load', storeOp: 'store' }]
+      });
+      pass.setPipeline(strokePipeline);
+      pass.setBindGroup(0, strokeBindGroup);
+      pass.setVertexBuffer(0, vertexBuf);
+      pass.draw(vertCount);
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      present();
+    }
+
+    // ---------- Undo/redo: GPU-to-GPU texture copies (cheap, no readback) ----------
+    function snapshotCurrent(){
+      const tex = makeAccTex();
+      const enc = device.createCommandEncoder();
+      enc.copyTextureToTexture({ texture: accTex }, { texture: tex }, [BW, BH]);
+      device.queue.submit([enc.finish()]);
+      return tex;
+    }
+    pushUndo = function(){
+      undoStack.push(snapshotCurrent());
+      if(undoStack.length > MAX_UNDO){ undoStack.shift().destroy(); }
+      while(redoStack.length){ redoStack.pop().destroy(); }
+    };
+    restore = function(stack, otherStack){
+      if(stack.length === 0) return;
+      otherStack.push(snapshotCurrent());
+      const tex = stack.pop();
+      const enc = device.createCommandEncoder();
+      enc.copyTextureToTexture({ texture: tex }, { texture: accTex }, [BW, BH]);
+      device.queue.submit([enc.finish()]);
+      tex.destroy();
+      present();
+    };
+    clearCanvas = function(){
+      pushUndo();
+      clearTexToWhite(accTex);
+      present();
+    };
+
+    // Margin, in backing-store pixels, added around each shape's true
+    // geometry when building its bounding quad. This just needs to be big
+    // enough that the ~1px antialiased edge (computed for real in the
+    // fragment shader, see strokeShader above) is fully inside the quad —
+    // it does NOT control how soft the edge looks anymore.
+    const AA_MARGIN = 2.0;
+
+    // Build a bounding quad (2 triangles) for a round dab. The true circle
+    // is defined by (cx,cy,r), carried per-vertex and resolved exactly in
+    // the fragment shader — a dab is just a zero-length capsule (p0 == p1).
+    function circleVerts(cx, cy, r, alpha){
+      const half = r + AA_MARGIN;
+      const x0 = cx-half, y0 = cy-half, x1 = cx+half, y1 = cy+half;
+      const v = (x,y) => [x,y, cx,cy, cx,cy, r, alpha];
+      const out = [];
+      out.push.apply(out, v(x0,y0)); out.push.apply(out, v(x1,y0)); out.push.apply(out, v(x1,y1));
+      out.push.apply(out, v(x0,y0)); out.push.apply(out, v(x1,y1)); out.push.apply(out, v(x0,y1));
+      return out;
+    }
+    // Build a bounding quad (2 triangles) for the capsule between two
+    // points — the straight part of a line segment. The true capsule is
+    // defined by (x0,y0)-(x1,y1) and r, carried per-vertex and resolved
+    // exactly (segment SDF) in the fragment shader.
+    function segmentVerts(x0,y0,x1,y1,r,alpha){
+      const dx = x1-x0, dy = y1-y0;
+      const len = Math.hypot(dx,dy) || 1;
+      const ux = dx/len, uy = dy/len;      // along-segment unit vector
+      const nx = -uy, ny = ux;             // normal unit vector
+      const ext = r + AA_MARGIN;           // extend past each endpoint to cover the rounded caps
+      const hw = r + AA_MARGIN;            // half-width across the segment
+      const p0 = { x: x0-ux*ext, y: y0-uy*ext };
+      const p1 = { x: x1+ux*ext, y: y1+uy*ext };
+      const c0 = { x: p0.x+nx*hw, y: p0.y+ny*hw };
+      const c1 = { x: p1.x+nx*hw, y: p1.y+ny*hw };
+      const c2 = { x: p1.x-nx*hw, y: p1.y-ny*hw };
+      const c3 = { x: p0.x-nx*hw, y: p0.y-ny*hw };
+      const v = (p) => [p.x,p.y, x0,y0, x1,y1, r, alpha];
+      const out = [];
+      out.push.apply(out, v(c0)); out.push.apply(out, v(c1)); out.push.apply(out, v(c2));
+      out.push.apply(out, v(c0)); out.push.apply(out, v(c2)); out.push.apply(out, v(c3));
+      return out;
+    }
+
+    let prevRaw = null;   // point two samples ago (curve control point source)
+    let lastRaw = null;   // most recent raw pointer position
+    let lastMid = null;   // last curve endpoint actually drawn (midpoint-based)
+    let lastR = null;     // radius actually used for the most recent segment (tracks pressure taper)
+    let lastAlpha = null; // alpha actually used for the most recent segment (tracks pressure taper)
+    let strokeMoved = false; // true once at least one point has been fed after beginStroke — a
+                              // plain click with no movement already got its dot from beginStroke,
+                              // so endStroke shouldn't stamp a second one on top of it
+    let lastFedRaw = null; // last raw (pre-smoothing) point that cleared the deadzone
+    let smoothBuf = [];    // windowed moving-average buffer (the piece that was missing)
+
+    // The EMA lag above only damps a fraction of each individual jump — it
+    // never fully removes high-frequency noise, it just delays it. A
+    // windowed moving average (what draw.html actually uses, on top of its
+    // own EMA) is a much stronger filter: it genuinely cancels noise that
+    // doesn't have a consistent direction across the window, which is
+    // exactly what jitter is. This was the missing piece — porting the
+    // zoom-scaled EMA and the deadzone alone wasn't enough.
+    function cornerRoundMaxLen(){
+      const base = Math.max(2, Math.round(2 + stabilization * 22));
+      return Math.round(base * zoomSmoothingFactor());
+    }
+    function pushSmoothBuf(p){
+      smoothBuf.push(p);
+      const maxLen = cornerRoundMaxLen();
+      while(smoothBuf.length > maxLen) smoothBuf.shift();
+      let sx = 0, sy = 0;
+      for(const pt of smoothBuf){ sx += pt.x; sy += pt.y; }
+      return { x: sx / smoothBuf.length, y: sy / smoothBuf.length };
+    }
+
+    beginStroke = function(e){
+      if(chaseRAF){ cancelAnimationFrame(chaseRAF); chaseRAF = null; }
+      const p = screenToCanvas(e.clientX, e.clientY);
+      pushUndo();
+      drawing = true;
+      prevRaw = p;
+      lastRaw = p;
+      lastMid = p;
+      lastFedRaw = p;
+      strokeMoved = false;
+      smoothBuf = [p];
+      const r = pressureRadius(getBrushSize(), getPressure(e));
+      lastR = r;
+      const a = pressureAlpha(getPressure(e));
+      lastAlpha = a;
+      const verts = circleVerts(p.x, p.y, r, a);
+      drawVertsIntoAcc(new Float32Array(verts), verts.length / 8, colorRgb, tool === 'eraser');
+    };
+
+    function drawQuadCurve(all, p0, control, p1, r0, r1, alpha, steps){
+      let prevPt = p0;
+      for(let i=1;i<=steps;i++){
+        const t = i/steps;
+        const mt = 1-t;
+        const x = mt*mt*p0.x + 2*mt*t*control.x + t*t*p1.x;
+        const y = mt*mt*p0.y + 2*mt*t*control.y + t*t*p1.y;
+        const r = r0 + (r1-r0)*t;
+        all.push.apply(all, segmentVerts(prevPt.x, prevPt.y, x, y, r, alpha));
+        all.push.apply(all, circleVerts(x, y, r, alpha));
+        prevPt = {x,y};
+      }
+      return prevPt;
+    }
+
+    // Feeds one point through the midpoint-quadratic curve fitter and
+    // advances lastMid/prevRaw/lastRaw. Factored out so moveStroke can call
+    // it multiple times per real sample (see subdivision below).
+    function feedPoint(all, raw, pressure){
+      strokeMoved = true;
+      const r = pressureRadius(getBrushSize(), pressure);
+      const a = pressureAlpha(pressure);
+      const midStart = lastMid;
+      const midEnd = { x: (lastRaw.x + raw.x) / 2, y: (lastRaw.y + raw.y) / 2 };
+      lastMid = drawQuadCurve(all, midStart, lastRaw, midEnd, r, r, a, 10);
+      lastR = r;
+      lastAlpha = a;
+      prevRaw = lastRaw;
+      lastRaw = raw;
+    }
+
+    moveStroke = function(e){
+      if(!drawing) return;
+      const t0 = performance.now();
+      const events = (typeof e.getCoalescedEvents === 'function' && e.getCoalescedEvents().length)
+        ? e.getCoalescedEvents() : [e];
+
+      // A small stabilization-driven lerp can still add a touch of extra
+      // smoothing at higher slider values, without ever fully "chasing".
+      // There's also a small fixed floor (0.25) applied even at 0%
+      // stabilization: raw mouse/sensor samples have real pixel-level
+      // jitter, and with getCoalescedEvents feeding every one of them in,
+      // that jitter renders faithfully as a wavy edge.
+      //
+      // IMPORTANT: this lerp is applied against `lastRaw`, and `lastRaw` is
+      // then updated to the *smoothed* result (not the true raw point) —
+      // so smoothing here is really a small exponential moving average.
+      // That's fine for slow, jittery movement, but during a fast scribble
+      // — especially zoomed out, where each pointer event covers a much
+      // larger canvas distance — the smoothed point can trail the real one
+      // by a growing distance, and on a quick direction reversal that lag
+      // makes the line bow outward into a loop instead of following the
+      // reversal. Capping how far the smoothed point is allowed to trail
+      // the raw one (in fixed canvas units, independent of zoom) keeps the
+      // damping effect for real jitter while making it impossible for fast
+      // motion to bow into a large loop.
+      // Same fix draw.html already uses (that file doesn't show this wobble):
+      // divide the follow/damping amount by zoomSmoothingFactor() so the
+      // fraction of real device-pixel jitter that gets through stays
+      // constant in *screen* pixels instead of growing by 1/zoom once
+      // converted to canvas space.
+      const smooth = 1 - Math.max(0.12, (1 - Math.max(0.25, Math.min(0.7, stabilization)) * 0.6) / zoomSmoothingFactor());
+      const maxLag = Math.max(4, scaledBrushSize() * 1.5);
+      // Deadzone: below this, treat the sample as noise and drop it
+      // entirely rather than smoothing it in — draw.html found this is what
+      // actually kills the wobble at its source (averaging still lets a
+      // little of every sample through; dropping sub-threshold ones removes
+      // it outright). 0.4 screen px, converted to backing-store units.
+      const deadzone = (0.4 * SS) / zoom;
+
+      // Second, independent source of bulging: the midpoint-quadratic curve
+      // (midStart -> control(lastRaw) -> midEnd) bows toward the control
+      // point by an amount that scales with how far the control point sits
+      // from the direct midStart-midEnd line — which scales with the raw
+      // sample spacing. Zoomed out + fast movement means each *real*
+      // pointer event covers a large canvas distance (same screen-space
+      // gesture, more canvas ground per sample), so a single curve-fit step
+      // between two far-apart samples bulges a lot — enough, on a quick
+      // reversal, to fork or loop even with the lag capped above. Splitting
+      // a long jump into several shorter straight-line sub-steps before
+      // curve-fitting bounds the bulge per step regardless of how far the
+      // real samples are apart.
+      const maxStep = Math.max(2, scaledBrushSize() * 0.6);
+
+      let all = [];
+      for(const ev of events){
+        let raw = screenToCanvas(ev.clientX, ev.clientY);
+
+        // Drop sub-deadzone movement outright instead of smoothing it in —
+        // this is what actually removes the wobble at its source, rather
+        // than just averaging a little of it through every sample.
+        if(Math.hypot(raw.x - lastFedRaw.x, raw.y - lastFedRaw.y) < deadzone){
+          continue;
+        }
+        lastFedRaw = raw;
+
+        if(smooth > 0){
+          let sx = lastRaw.x + (raw.x - lastRaw.x) * (1 - smooth);
+          let sy = lastRaw.y + (raw.y - lastRaw.y) * (1 - smooth);
+          const lagDx = raw.x - sx, lagDy = raw.y - sy;
+          const lagDist = Math.hypot(lagDx, lagDy);
+          if(lagDist > maxLag){
+            const k = lagDist > 0 ? maxLag / lagDist : 0;
+            sx = raw.x - lagDx * k;
+            sy = raw.y - lagDy * k;
+          }
+          raw = { x: sx, y: sy };
+        }
+        raw = pushSmoothBuf(raw);
+        const pressure = getPressure(ev);
+
+        const jumpDx = raw.x - lastRaw.x, jumpDy = raw.y - lastRaw.y;
+        const jumpDist = Math.hypot(jumpDx, jumpDy);
+        if(jumpDist > maxStep){
+          const origin = lastRaw;
+          const steps = Math.ceil(jumpDist / maxStep);
+          for(let i = 1; i <= steps; i++){
+            const t = i / steps;
+            feedPoint(all, {
+              x: origin.x + jumpDx * t,
+              y: origin.y + jumpDy * t
+            }, pressure);
+          }
+        } else {
+          feedPoint(all, raw, pressure);
+        }
+      }
+      if(all.length){
+        const arr = new Float32Array(all);
+        drawVertsIntoAcc(arr, arr.length / 8, colorRgb, tool === 'eraser');
+      }
+      reportPerf(performance.now() - t0);
+    };
+
+    endStroke = function(){
+      if(!drawing) return;
+      drawing = false;
+      // Draw a final short curve segment out to the last raw point so the
+      // stroke doesn't end abruptly at the last midpoint. Skip this for a
+      // plain click with no movement — beginStroke already stamped the dot
+      // for that case, and stamping again here would double it up.
+      if(strokeMoved && lastMid && lastRaw){
+        const r = lastR != null ? lastR : scaledBrushSize() / 2;
+        const a = lastAlpha != null ? lastAlpha : opacity;
+        const all = [];
+        all.push.apply(all, segmentVerts(lastMid.x, lastMid.y, lastRaw.x, lastRaw.y, r, a));
+        // Small round cap at the tip only, sized to match the tapered
+        // stroke width — not the full brush size — so lifting the pen
+        // doesn't stamp an oversized dot at the end.
+        all.push.apply(all, circleVerts(lastRaw.x, lastRaw.y, r, a));
+        const arr = new Float32Array(all);
+        drawVertsIntoAcc(arr, arr.length / 8, colorRgb, tool === 'eraser');
+      }
+      prevRaw = null;
+      lastRaw = null;
+      lastMid = null;
+      lastR = null;
+      lastAlpha = null;
+      lastFedRaw = null;
+      smoothBuf = [];
+    };
+
+  } else {
+    // ================= Canvas2D fallback (no WebGPU / no hardware GPU) =================
+    const ctx2d = canvas.getContext('2d');
+    ctx2d.fillStyle = '#ffffff';
+    ctx2d.fillRect(0, 0, BW, BH);
+
+    function snapshot(){ return ctx2d.getImageData(0, 0, BW, BH); }
+
+    pushUndo = function(){
+      undoStack.push(snapshot());
+      if(undoStack.length > MAX_UNDO) undoStack.shift();
+      redoStack.length = 0;
+    };
+    restore = function(stack, otherStack){
+      if(stack.length === 0) return;
+      otherStack.push(snapshot());
+      ctx2d.putImageData(stack.pop(), 0, 0);
+    };
+    clearCanvas = function(){
+      pushUndo();
+      ctx2d.fillStyle = '#ffffff';
+      ctx2d.fillRect(0, 0, BW, BH);
+    };
+
+    let lastPt = null;
+
+    beginStroke = function(e){
+      pushUndo();
+      drawing = true;
+      const p = screenToCanvas(e.clientX, e.clientY);
+      lastPt = p;
+      ctx2d.globalAlpha = opacity;
+      ctx2d.fillStyle = tool === 'eraser' ? '#ffffff' : color;
+      ctx2d.beginPath();
+      ctx2d.arc(p.x, p.y, scaledBrushSize() / 2, 0, Math.PI * 2);
+      ctx2d.fill();
+    };
+
+    moveStroke = function(e){
+      if(!drawing || !lastPt) return;
+      const events = (typeof e.getCoalescedEvents === 'function' && e.getCoalescedEvents().length)
+        ? e.getCoalescedEvents() : [e];
+      ctx2d.globalAlpha = opacity;
+      ctx2d.strokeStyle = tool === 'eraser' ? '#ffffff' : color;
+      ctx2d.lineWidth = scaledBrushSize();
+      ctx2d.lineCap = 'round';
+      ctx2d.lineJoin = 'round';
+      for(const ev of events){
+        const p = screenToCanvas(ev.clientX, ev.clientY);
+        ctx2d.beginPath();
+        ctx2d.moveTo(lastPt.x, lastPt.y);
+        ctx2d.lineTo(p.x, p.y);
+        ctx2d.stroke();
+        lastPt = p;
+      }
+    };
+
+    endStroke = function(){
+      drawing = false;
+      lastPt = null;
+    };
+  }
+
+  // ---------- Pointer events ----------
+  stageWrap.addEventListener('pointerdown', (e)=>{
+    if(e.button === 1){ startPan(e); return; }
+    if(cDown){ startSizeDrag(e); return; }
+    if(spaceDown && ctrlDown){ startZoomDrag(e); return; }
+    if(spaceDown){ startPan(e); return; }
+    if(e.button !== 0 && e.pointerType !== 'pen' && e.pointerType !== 'touch') return;
+    // Ignore a second pointer (palm touch, stray click, pen+mouse at once)
+    // while a stroke from a different pointer is already in progress — a
+    // beginStroke() here would reset the shared lastRaw/lastMid/prevRaw
+    // state to this new pointer's position, and the original pointer's
+    // next moveStroke would then draw a straight line connecting the old
+    // stroke's last point to the new pointer's position: exactly the thin,
+    // unwavy "ghost" diagonal line artifact.
+    if(drawing && activePointerId !== null && e.pointerId !== activePointerId) return;
+    stageWrap.setPointerCapture(e.pointerId);
+    activePointerId = e.pointerId;
+    beginStroke(e);
+    updateBrushPreview();
+  });
+
+  stageWrap.addEventListener('pointermove', (e)=>{
+    const wrapRect = stageWrap.getBoundingClientRect();
+    hoverX = e.clientX - wrapRect.left;
+    hoverY = e.clientY - wrapRect.top;
+    hoverPressure = getHoverPressure(e);
+    hovering = true;
+    if(isSizeDragging){ doSizeDrag(e); return; }
+    if(isZoomDragging){ doZoomDrag(e); updateBrushPreview(); return; }
+    if(isPanning){ doPan(e); updateBrushPreview(); return; }
+    if(drawing && e.pointerId === activePointerId) moveStroke(e);
+    updateBrushPreview();
+  });
+
+  stageWrap.addEventListener('pointerenter', (e)=>{
+    hovering = true;
+    hoverPressure = getHoverPressure(e);
+    updateBrushPreview();
+  });
+  stageWrap.addEventListener('pointerleave', ()=>{
+    hovering = false;
+    if(!isSizeDragging) hideSizePreview();
+  });
+
+  window.addEventListener('pointerup', (e)=>{
+    if(isSizeDragging){ stopSizeDrag(); return; }
+    if(isZoomDragging){ stopZoomDrag(); return; }
+    if(isPanning){ stopPan(); return; }
+    if(drawing && e.pointerId !== activePointerId) return;
+    endStroke();
+    activePointerId = null;
+    updateBrushPreview();
+  });
+  window.addEventListener('pointercancel', (e)=>{
+    if(drawing && e.pointerId !== activePointerId){ return; }
+    endStroke();
+    activePointerId = null;
+    stopPan(); stopZoomDrag(); stopSizeDrag();
+    updateBrushPreview();
+  });
+
+  stageWrap.addEventListener('touchstart', (e)=>{ if(e.touches.length>1) e.preventDefault(); }, {passive:false});
+
+  // ---------- Panning ----------
+  function startPan(e){
+    isPanning = true;
+    panStart = {x: e.clientX, y: e.clientY, panX, panY};
+    stageWrap.style.cursor = 'grab';
+    stageWrap.setPointerCapture(e.pointerId);
+  }
+  function doPan(e){
+    if(!panStart) return;
+    panX = panStart.panX + (e.clientX - panStart.x);
+    panY = panStart.panY + (e.clientY - panStart.y);
+    applyTransform();
+  }
+  function stopPan(){
+    isPanning = false;
+    panStart = null;
+    updateIdleCursor();
+    updateBrushPreview();
+  }
+
+  // ---------- Zoom-drag (Ctrl + Space + drag) ----------
+  function startZoomDrag(e){
+    isZoomDragging = true;
+    const wrapRect = stageWrap.getBoundingClientRect();
+    const anchorX = e.clientX - wrapRect.left;
+    const anchorY = e.clientY - wrapRect.top;
+    zoomDragStart = {
+      startClientX: e.clientX, startZoom: zoom, anchorX, anchorY,
+      canvasX: (anchorX - panX) / zoom, canvasY: (anchorY - panY) / zoom
+    };
+    stageWrap.style.cursor = 'ew-resize';
+    stageWrap.setPointerCapture(e.pointerId);
+  }
+  function doZoomDrag(e){
+    if(!zoomDragStart) return;
+    // Zoom around the cursor's position from *before* the drag started —
+    // not wherever the cursor is right now — so dragging left/right purely
+    // controls zoom amount while the same point stays anchored under
+    // where you began.
+    const dx = e.clientX - zoomDragStart.startClientX;
+    const factor = Math.pow(1.006, dx);
+    let newZoom = zoomDragStart.startZoom * factor;
+    newZoom = Math.min(Math.max(newZoom, 0.05), 30);
+    panX = zoomDragStart.anchorX - zoomDragStart.canvasX * newZoom;
+    panY = zoomDragStart.anchorY - zoomDragStart.canvasY * newZoom;
+    zoom = newZoom;
+    applyTransform();
+  }
+  function stopZoomDrag(){
+    isZoomDragging = false;
+    zoomDragStart = null;
+    updateIdleCursor();
+    updateBrushPreview();
+  }
+
+  // ---------- Brush resize-drag (C + drag) ----------
+  function startSizeDrag(e){
+    isSizeDragging = true;
+    const wrapRect = stageWrap.getBoundingClientRect();
+    sizeDragStart = {
+      clientX: e.clientX, clientY: e.clientY,
+      size: getBrushSize(),
+      anchorX: e.clientX - wrapRect.left,
+      anchorY: e.clientY - wrapRect.top,
+    };
+    stageWrap.style.cursor = 'ew-resize';
+    stageWrap.setPointerCapture(e.pointerId);
+    showSizePreview(sizeDragStart.anchorX, sizeDragStart.anchorY, getBrushSize());
+  }
+  function doSizeDrag(e){
+    if(!sizeDragStart) return;
+    // Horizontal drag = coarse control, vertical = fine control — right and
+    // down both grow the brush, left and up both shrink it.
+    const dx = e.clientX - sizeDragStart.clientX;
+    const dy = sizeDragStart.clientY - e.clientY;
+    const delta = dx * 0.6 - dy * 0.15;
+    let newSize = Math.round(sizeDragStart.size + delta);
+    newSize = Math.min(Math.max(newSize, 1), 150);
+    setBrushSize(newSize);
+    sizeSlider.value = newSize;
+    sizeVal.textContent = newSize;
+    showSizePreview(sizeDragStart.anchorX, sizeDragStart.anchorY, getBrushSize());
+  }
+  function stopSizeDrag(){
+    isSizeDragging = false;
+    sizeDragStart = null;
+    updateIdleCursor();
+    updateBrushPreview();
+  }
+  // Wrap-relative screen coords <-> backing-store canvas coords, without
+  // the wrapRect subtraction screenToCanvas does (anchorX/anchorY here are
+  // already wrap-relative).
+  function wrapToCanvas(x, y){
+    return { x: (x - panX) / zoom * SS, y: (y - panY) / zoom * SS };
+  }
+  function canvasToWrap(bx, by){
+    return { x: (bx / SS) * zoom + panX, y: (by / SS) * zoom + panY };
+  }
+
+  function showSizePreview(anchorX, anchorY, size, pressure){
+    // Unlike an actual stroke (which should legitimately fade to near-nothing
+    // at true zero pressure — you're not touching yet), the preview exists
+    // purely as a look-ahead gauge and needs to stay visible even while a
+    // pen is hovering with ~0 pressure. Floor the pressure INPUT here (not
+    // the resulting alpha/radius) so it still runs through the same curve
+    // and still visibly grows as real pressure increases — it just never
+    // starts from a value low enough to vanish.
+    const PREVIEW_MIN_PRESSURE = 0.3;
+    pressure = pressure == null ? 1 : Math.max(PREVIEW_MIN_PRESSURE, pressure);
+    // Render the preview at the SAME fixed backing-store density the real
+    // canvas uses (size * SS, independent of zoom/DPR), then let CSS scale
+    // it up by `zoom` — exactly how the real canvas is displayed. Using a
+    // fresh dpr-scaled canvas every time (the old approach) always drew a
+    // natively browser-smoothed circle, so it never matched what the actual
+    // dab will look like once zoomed in past the "pixelated" threshold: the
+    // real paint shows its true supersampled texels as visible blocks, but
+    // the preview stayed silky smooth. Matching the backing resolution and
+    // the image-rendering rule makes the preview a true, honest look-ahead.
+    //
+    // On top of that: the preview also needs to sit at the same PHASE on
+    // the texel grid as a real dab would. Previously it was always drawn
+    // dead-centered in its own little canvas and just followed the raw
+    // mouse position — so its blocky pattern never actually shifted in sync
+    // with the real canvas underneath as you moved the cursor, it just slid
+    // around independently. Snapping the preview's origin to an integer
+    // backing-store pixel (the same grid the real canvas rasterizes into)
+    // and keeping the circle's sub-pixel offset within that box makes the
+    // preview's antialiasing genuinely track the canvas as you move.
+    //
+    // The box itself always stays sized for the FULL brush (unscaled
+    // `size`) so it doesn't constantly resize frame to frame; only the
+    // drawn circle's radius is scaled by pressure. A mouse has no pressure
+    // concept and always previews at full size; a hovering pen reports
+    // near-zero pressure until it touches down, so its preview starts tiny
+    // and grows into the full dab as it's pressed — a real look-ahead of
+    // the next stamp's actual size.
+    const margin = 4; // backing-store px of headroom for the AA edge
+    const backingSize = Math.max(1, Math.round(size * SS)) + margin * 2;
+    const rBacking = pressureRadius(size, pressure);
+
+    const cursorCanvas = wrapToCanvas(anchorX, anchorY);
+    const originBX = Math.floor(cursorCanvas.x - backingSize / 2);
+    const originBY = Math.floor(cursorCanvas.y - backingSize / 2);
+    const cBackingX = cursorCanvas.x - originBX; // fractional center within the box
+    const cBackingY = cursorCanvas.y - originBY;
+
+    const originWrap = canvasToWrap(originBX, originBY);
+    const cssSize = backingSize / SS * zoom;
+
+    sizePreview.style.display = 'block';
+    sizePreview.style.left = originWrap.x + 'px';
+    sizePreview.style.top = originWrap.y + 'px';
+    sizePreview.style.width = cssSize + 'px';
+    sizePreview.style.height = cssSize + 'px';
+    // Same rule the main canvas uses: crisp blocky texels once zoomed in
+    // past the threshold, smooth bilinear scaling below it.
+    sizePreview.style.imageRendering = zoom >= 3.01 ? 'pixelated' : 'auto';
+
+    if(sizePreview.width !== backingSize || sizePreview.height !== backingSize){
+      sizePreview.width = backingSize;
+      sizePreview.height = backingSize;
+    }
+    sizePreviewCtx.setTransform(1, 0, 0, 1, 0, 0);
+    sizePreviewCtx.clearRect(0, 0, backingSize, backingSize);
+    sizePreviewCtx.beginPath();
+    sizePreviewCtx.arc(cBackingX, cBackingY, rBacking, 0, Math.PI * 2);
+
+    if(tool === 'eraser'){
+      sizePreviewCtx.save();
+      sizePreviewCtx.clip();
+      sizePreviewCtx.fillStyle = '#fff';
+      sizePreviewCtx.fillRect(0, 0, backingSize, backingSize);
+      sizePreviewCtx.fillStyle = '#cfcfcf';
+      const cell = 6 * SS;
+      for(let y = 0; y < backingSize; y += cell){
+        for(let x = 0; x < backingSize; x += cell){
+          if(((x/cell + y/cell) % 2) === 0) sizePreviewCtx.fillRect(x, y, cell, cell);
+        }
+      }
+      sizePreviewCtx.restore();
+    } else {
+      sizePreviewCtx.globalAlpha = pressureAlpha(pressure);
+      sizePreviewCtx.fillStyle = color;
+      sizePreviewCtx.fill();
+    }
+  }
+  function hideSizePreview(){
+    sizePreview.style.display = 'none';
+  }
+
+  // Live brush-size preview that tracks the pointer whenever it's hovering
+  // the canvas (and isn't busy resizing/panning/zooming, which already show
+  // their own preview via showSizePreview above).
+  function updateBrushPreview(){
+    if(isSizeDragging) return;
+    if(drawing){ hideSizePreview(); return; }
+    if(isZoomDragging && zoomDragStart){
+      // Pin the dab at the cursor position from *before* zooming started,
+      // rather than tracking the live cursor while Ctrl+Space+drag is
+      // actively changing the zoom.
+      showSizePreview(zoomDragStart.anchorX, zoomDragStart.anchorY, getBrushSize());
+      return;
+    }
+    if(!hovering || hoverX === null) { hideSizePreview(); return; }
+    showSizePreview(hoverX, hoverY, getBrushSize(), hoverPressure);
+  }
+
+  function isTypingTarget(el){
+    if(!el) return false;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+  }
+
+  function updateIdleCursor(){
+    if(isPanning || isZoomDragging || isSizeDragging) return;
+    if(spaceDown && ctrlDown) stageWrap.style.cursor = 'zoom-in';
+    else if(spaceDown) stageWrap.style.cursor = 'grab';
+    else if(cDown) stageWrap.style.cursor = 'ew-resize';
+    else stageWrap.style.cursor = 'none'; // the brush-size circle stands in for the cursor
+  }
+
+  window.addEventListener('keydown', (e)=>{
+    if(isTypingTarget(e.target)) return;
+    if(e.code === 'Space'){ spaceDown = true; e.preventDefault(); updateIdleCursor(); }
+    if(e.key === 'Control'){ ctrlDown = true; updateIdleCursor(); }
+    if(e.key.toLowerCase() === 'c' && !e.ctrlKey && !e.metaKey && !e.altKey){
+      cDown = true; updateIdleCursor();
+    }
+    if(e.key.toLowerCase() === 'w' && !e.ctrlKey && !e.metaKey && !e.altKey){
+      e.preventDefault();
+      clearCanvas();
+    }
+    if(e.key.toLowerCase() === 'e' && !e.ctrlKey && !e.metaKey && !e.altKey){
+      e.preventDefault();
+      selectTool('eraser');
+    }
+    if(e.key.toLowerCase() === 'b' && !e.ctrlKey && !e.metaKey && !e.altKey){
+      e.preventDefault();
+      selectTool('pen');
+    }
+    if((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase()==='z'){
+      e.preventDefault(); restore(undoStack, redoStack);
+    }
+    if((e.ctrlKey || e.metaKey) && (e.key.toLowerCase()==='y' || (e.shiftKey && e.key.toLowerCase()==='z'))){
+      e.preventDefault(); restore(redoStack, undoStack);
+    }
+  });
+  window.addEventListener('keyup', (e)=>{
+    if(e.code === 'Space'){ spaceDown = false; updateIdleCursor(); }
+    if(e.key === 'Control'){ ctrlDown = false; updateIdleCursor(); }
+    if(e.key.toLowerCase() === 'c'){
+      cDown = false;
+      if(isSizeDragging) stopSizeDrag();
+      updateIdleCursor();
+    }
+  });
+  window.addEventListener('blur', ()=>{
+    spaceDown=false; ctrlDown=false; cDown=false;
+    if(isSizeDragging) stopSizeDrag();
+    updateIdleCursor();
+  });
+
+  // ---------- Zoom (wheel) ----------
+  stageWrap.addEventListener('wheel', (e)=>{
+    e.preventDefault();
+    const wrapRect = stageWrap.getBoundingClientRect();
+    const mx = e.clientX - wrapRect.left;
+    const my = e.clientY - wrapRect.top;
+    const cx = (mx - panX) / zoom;
+    const cy = (my - panY) / zoom;
+    const delta = -e.deltaY;
+    const factor = delta > 0 ? 1.08 : 1/1.08;
+    let newZoom = zoom * factor;
+    newZoom = Math.min(Math.max(newZoom, 0.05), 30);
+    panX = mx - cx * newZoom;
+    panY = my - cy * newZoom;
+    zoom = newZoom;
+    applyTransform();
+    updateBrushPreview();
+  }, {passive:false});
+
+  // ---------- UI wiring ----------
+  const toolPen = document.getElementById('toolPen');
+  const toolEraser = document.getElementById('toolEraser');
+  function selectTool(t){
+    if(tool === t) return;
+    tool = t;
+    toolPen.classList.toggle('active', t === 'pen');
+    toolEraser.classList.toggle('active', t === 'eraser');
+    // Each tool keeps its own size — reflect the newly-selected tool's size
+    // in the slider/readout instead of leaving the previous tool's value showing.
+    sizeSlider.value = getBrushSize();
+    sizeVal.textContent = getBrushSize();
+    updateBrushPreview();
+  }
+  toolPen.onclick = ()=> selectTool('pen');
+  toolEraser.onclick = ()=> selectTool('eraser');
+
+  document.getElementById('colorPicker').oninput = (e)=>{ color = e.target.value; colorRgb = hexToRgb(color); updateBrushPreview(); };
+
+  const sizeSlider = document.getElementById('sizeSlider');
+  const sizeVal = document.getElementById('sizeVal');
+  sizeSlider.oninput = (e)=>{ setBrushSize(+e.target.value); sizeVal.textContent = getBrushSize(); updateBrushPreview(); };
+
+  const opSlider = document.getElementById('opSlider');
+  const opVal = document.getElementById('opVal');
+  opSlider.oninput = (e)=>{ opacity = (+e.target.value)/100; opVal.textContent = e.target.value; updateBrushPreview(); };
+
+  const stabSlider = document.getElementById('stabSlider');
+  const stabVal = document.getElementById('stabVal');
+  stabSlider.oninput = (e)=>{ stabilization = (+e.target.value)/100; stabVal.textContent = e.target.value; };
+  if(!useWebGPU){ stabSlider.disabled = true; stabSlider.title = 'Stabilization requires WebGPU'; }
+
+  document.getElementById('undoBtn').onclick = ()=> restore(undoStack, redoStack);
+  document.getElementById('redoBtn').onclick = ()=> restore(redoStack, undoStack);
+
+  document.getElementById('clearBtn').onclick = clearCanvas;
+
+  document.getElementById('zoomInBtn').onclick = ()=> zoomStep(1.15);
+  document.getElementById('zoomOutBtn').onclick = ()=> zoomStep(1/1.15);
+  document.getElementById('zoomResetBtn').onclick = fitToScreen;
+
+  function zoomStep(factor){
+    const wrapRect = stageWrap.getBoundingClientRect();
+    // Anchor the zoom on the last known cursor position (if it's actually
+    // within the canvas area) so the +/- buttons zoom the same way the
+    // wheel does — staying under the cursor — instead of always zooming
+    // around the screen's center.
+    const mx = (hovering && hoverX !== null && hoverX >= 0 && hoverX <= wrapRect.width)
+      ? hoverX : wrapRect.width/2;
+    const my = (hovering && hoverY !== null && hoverY >= 0 && hoverY <= wrapRect.height)
+      ? hoverY : wrapRect.height/2;
+    const cx = (mx - panX)/zoom, cy = (my - panY)/zoom;
+    zoom = Math.min(Math.max(zoom*factor, 0.05), 30);
+    panX = mx - cx*zoom;
+    panY = my - cy*zoom;
+    applyTransform();
+  }
+
+  document.getElementById('saveBtn').onclick = ()=>{
+    const link = document.createElement('a');
+    link.download = 'canvas-1920x1080.png';
+    link.href = canvas.toDataURL('image/png');
+    link.click();
+  };
+
+  stageWrap.addEventListener('contextmenu', e=> e.preventDefault());
+
+  window.addEventListener('resize', fitToScreen);
+  fitToScreen();
+  updateIdleCursor();
+}catch(err){
+  console.error('Canvas Studio fatal error:', err);
+  gpuBadge.textContent = 'Script error: ' + err.message;
+  gpuBadge.className = 'bad';
+  fatal.querySelector('p').textContent = err.message + ' (see browser console for the full stack trace)';
+  fatal.classList.add('show');
+}
+})();
+</script>
+</body>
+</html>
