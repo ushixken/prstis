@@ -478,23 +478,16 @@ try{
         let pa = in.pos.xy - in.p0;
         let ba = in.p1 - in.p0;
         let denom = dot(ba, ba);
-        let segmentLength = sqrt(max(denom, 1e-6));
         let rawH = dot(pa, ba) / max(denom, 1e-6);
         let h = clamp(rawH, 0.0, 1.0);
         let localRadius = mix(in.r0, in.r1, h);
-        let radialDistance = length(pa - ba * h) - localRadius;
         let isRoundDab = denom < 1e-6;
-        // Slightly overlap the butt ends of moving segments. This produces
-        // one continuous tapered outline instead of a round cap at every
-        // reconstructed curve join, which caused the tooth-like pixels.
-        let joinOverlap = 0.75;
-        let axialDistance = max(
-          -rawH * segmentLength - joinOverlap,
-          (rawH - 1.0) * segmentLength - joinOverlap
-        );
-        let taperedDistance = max(radialDistance, axialDistance);
         let roundDabDistance = length(pa) - in.r0;
-        let d = select(taperedDistance, roundDabDistance, isRoundDab);
+        // Moving curve pieces use rounded endpoint coverage so consecutive
+        // pieces form a true union at turns instead of overlapping flat-end
+        // wedges that radiate outward into bow-tie/fan artifacts.
+        let segmentDistance = length(pa - ba * h) - localRadius;
+        let d = select(segmentDistance, roundDabDistance, isRoundDab);
         // fwidth(d) is how much d changes per screen pixel at this
         // fragment — using it as the step width keeps the edge a crisp,
         // constant ~1px transition at any zoom or supersample factor,
