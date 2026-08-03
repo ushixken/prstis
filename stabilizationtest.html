@@ -811,6 +811,7 @@ try{
     // positions have equal weight. This is an original hypothesis, not a
     // claim about Lazy Nezumi's proprietary implementation.
     let smoothBuf = [];
+    let lastMoveEventTime = 0;
     let pressureBuf = [];
     let delayedPressure = 0;
     // Mirrors pushSmoothBuf's windowing exactly, but for pressure instead of
@@ -939,6 +940,7 @@ try{
       recentSpeedPxMs = 0;
       lastVelRaw = p;
       lastVelTime = performance.now();
+      lastMoveEventTime = performance.now();
       const r = pressureRadius(getBrushSize(), startPressure);
       lastR = r;
       const a = pressureAlpha(startPressure);
@@ -1046,6 +1048,7 @@ try{
       processStrokeBatch({ getCoalescedEvents(){ return samples; } });
     }
     moveStroke = function(e){
+      lastMoveEventTime = performance.now();
       const source = (typeof e.getCoalescedEvents === 'function' && e.getCoalescedEvents().length)
         ? e.getCoalescedEvents() : [e];
       for(const ev of source){
@@ -1180,6 +1183,16 @@ try{
       const baseFinishPressure = delayedPressure;
       const pointerupRawPressure = e && typeof e.pressure === 'number' ? e.pressure : null;
 
+      // If the pen was held still for a while before lifting, this isn't a
+      // "release out of a stroke" — there's no stroke motion to taper off
+      // of, just stabilization finishing its catch-up to a point you'd
+      // already stopped at. That should land as a flat, even-width stop,
+      // not a tapered point. Only an immediate lift straight out of active
+      // motion gets the tapered release.
+      const HOLD_BEFORE_LIFT_MS = 450;
+      const heldDurationMs = performance.now() - lastMoveEventTime;
+      const wasHeldBeforeLift = heldDurationMs >= HOLD_BEFORE_LIFT_MS;
+
       const startDist = endpoint ? Math.hypot(endpoint.x - lastRaw.x, endpoint.y - lastRaw.y) : 0;
 
       // taperReachPx: fixed physical length (backward from the true
@@ -1191,6 +1204,8 @@ try{
       // at high stabilization. Bounding the fade to a short, fixed reach
       // near the endpoint keeps the tip landing precisely on the endpoint
       // without dragging a faint tail across the whole catch-up distance.
+      // When wasHeldBeforeLift, this reach is irrelevant — no fade is
+      // applied at all (see releaseEnvelope calls below).
       const baseReachPx = 60;
       const minReachPx = 45;
       const maxReachPx = 260;
@@ -1217,6 +1232,8 @@ try{
         startDist,
         taperReachPx,
         effectiveTaperReach,
+        heldDurationMs,
+        wasHeldBeforeLift,
         targetDurationMs: 0,
         lastContactPressure: baseFinishPressure,
         pointerupRawPressure,
@@ -1292,7 +1309,7 @@ try{
 
         if(remaining <= 0.15 || smoothBuf.length === 0){
           if(!tailAlreadyDrawn){
-            const finalPressure = baseFinishPressure * releaseEnvelope(1);
+            const finalPressure = wasHeldBeforeLift ? baseFinishPressure : (baseFinishPressure * releaseEnvelope(1));
             const all = [];
             feedPoint(all, endpoint, finalPressure);
             if(all.length){
@@ -1330,7 +1347,7 @@ try{
 
           const stepRemaining = Math.hypot(endpoint.x - caught.x, endpoint.y - caught.y);
           const pathProgress = Math.max(0, Math.min(1, 1 - (stepRemaining / effectiveTaperReach)));
-          const emittedPressure = baseFinishPressure * releaseEnvelope(pathProgress);
+          const emittedPressure = wasHeldBeforeLift ? baseFinishPressure : (baseFinishPressure * releaseEnvelope(pathProgress));
 
           if(diag.frames.length < 60){
             diag.frames.push({
