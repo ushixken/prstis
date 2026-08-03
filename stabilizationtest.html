@@ -1037,10 +1037,21 @@ try{
       lastRaw = p;
       lastMid = p;
       strokeMoved = false;
-      smoothBuf = [p];
+      __feedPointCallIndex = 0; // reset stroke-start diagnostic counter (see feedPoint)
+      const amount = movingAverageAmount();
+      // Prefill both buffers to the full moving-average window length at
+      // pointer-down, instead of starting from a single sample. Without
+      // this, the first N samples of a stroke get averaged over a buffer
+      // that is still filling up (1 sample, then 2, then 3, ... up to
+      // `amount`), so stabilization strength ramps from "off" to "full"
+      // over the first N points instead of being constant from the very
+      // first move. Each slot is created via its own `() => ({...})` call
+      // (not a shared object literal), so later in-place mutation of one
+      // buffer entry can never alias another.
+      smoothBuf = Array.from({ length: amount }, () => ({ x: p.x, y: p.y }));
       lastInputRaw = p;
       const startPressure = effectivePressure(getPressure(e));
-      pressureBuf = [startPressure];
+      pressureBuf = Array.from({ length: amount }, () => startPressure);
       delayedPressure = startPressure;
       lastInputPressure = startPressure;
       lastContactPressure = startPressure;
@@ -1086,6 +1097,12 @@ try{
     // pointerup) can be inspected to confirm raw/pressure/radius all came
     // from the same tick, and that delayedPressure at call time matches
     // the pressure argument actually passed in.
+    // TEMPORARY DIAGNOSTIC (stroke-start stabilization investigation only —
+    // remove once the startup-kink question is settled). Logs p0/control/p1,
+    // buffer length, the stabilized output point, and the tangent direction
+    // for the first three feedPoint() calls of each stroke, so the first
+    // (potentially degenerate) curve segment can be inspected directly.
+    let __feedPointCallIndex = 0;
     function feedPoint(all, raw, pressure){
       strokeMoved = true;
       const r = pressureRadius(getBrushSize(), pressure);
@@ -1093,6 +1110,22 @@ try{
       const midStart = lastMid;
       const midEnd = { x: (lastRaw.x + raw.x) / 2, y: (lastRaw.y + raw.y) / 2 };
       const startR = lastR == null ? r : lastR;
+      if(__feedPointCallIndex < 3){
+        const tangent = { x: midEnd.x - midStart.x, y: midEnd.y - midStart.y };
+        const tangentLen = Math.hypot(tangent.x, tangent.y);
+        console.log('[feedPoint diag]', {
+          call: __feedPointCallIndex,
+          p0: { x: midStart.x, y: midStart.y },
+          control: { x: lastRaw.x, y: lastRaw.y },
+          p1: midEnd,
+          smoothBufLength: smoothBuf.length,
+          stabilizedOutput: raw,
+          tangentDirection: tangentLen > 1e-6
+            ? { x: tangent.x / tangentLen, y: tangent.y / tangentLen }
+            : 'degenerate (p0 == p1)'
+        });
+      }
+      __feedPointCallIndex++;
       lastMid = drawQuadCurve(all, midStart, lastRaw, midEnd, startR, r, a, 10);
       lastR = r;
       lastAlpha = a;
