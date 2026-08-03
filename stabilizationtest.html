@@ -923,6 +923,44 @@ try{
       lastVelTime = now;
     }
 
+    // --- Release-velocity rolling window (Moving/Flick Release taper) ---
+    // Separate from recentSpeedPxMs above: that one is an exponential
+    // smoothing of instantaneous inter-sample speed, useful for the
+    // stationary-vs-moving classification. The flick taper instead wants
+    // a genuine windowed distance/time measurement over the last ~40-80ms
+    // of *raw* pen movement, so a single noisy final sample can't dominate
+    // it and a brief stutter mid-flick can't be mistaken for a slow lift.
+    const RELEASE_VEL_WINDOW_MS = 80;   // keep raw samples covering up to this much history
+    let releaseVelWindow = []; // {x,y,t} raw (unstabilized) canvas-space samples
+    let smoothedReleaseVelocityCanvasPxMs = 0; // lightly smoothed, canvas backing-pixel units
+    function pushReleaseVelWindow(raw, timeStamp){
+      const t = Number.isFinite(timeStamp) ? timeStamp : performance.now();
+      releaseVelWindow.push({ x: raw.x, y: raw.y, t });
+      while(releaseVelWindow.length > 1 && t - releaseVelWindow[0].t > RELEASE_VEL_WINDOW_MS){
+        releaseVelWindow.shift();
+      }
+      if(releaseVelWindow.length >= 2){
+        const newest = releaseVelWindow[releaseVelWindow.length - 1];
+        const oldest = releaseVelWindow[0];
+        const dt = Math.max(1, newest.t - oldest.t);
+        const dist = Math.hypot(newest.x - oldest.x, newest.y - oldest.y);
+        const instWindowed = dist / dt;
+        // Light exponential smoothing so one noisy event can't create a
+        // large taper on its own.
+        smoothedReleaseVelocityCanvasPxMs = smoothedReleaseVelocityCanvasPxMs * 0.7 + instWindowed * 0.3;
+      }
+    }
+    // Converts a canvas backing-pixel value into true screen-space pixels,
+    // so flick-strength thresholds and taper lengths behave consistently
+    // regardless of zoom level (screenToCanvas divides by zoom and
+    // multiplies by SS to get canvas/backing space; this undoes that).
+    function canvasPxToScreenPx(canvasPx){
+      return canvasPx * zoom / SS;
+    }
+    function screenPxToCanvasPx(screenPx){
+      return screenPx * SS / zoom;
+    }
+
     function movingAverageAmount(){
       if(stabilization <= 0) return 1;
       return Math.max(2, Math.round(stabilization * 100));
@@ -1010,6 +1048,8 @@ try{
       lastVelRaw = p;
       lastVelTime = performance.now();
       lastMoveEventTime = performance.now();
+      releaseVelWindow = [{ x: p.x, y: p.y, t: performance.now() }];
+      smoothedReleaseVelocityCanvasPxMs = 0;
       const r = pressureRadius(getBrushSize(), startPressure);
       lastR = r;
       const a = pressureAlpha(startPressure);
@@ -1075,6 +1115,7 @@ try{
         const rawPressure = getPressure(ev);
         const pressure = effectivePressure(rawPressure);
         trackVelocity(inputRaw, ev.timeStamp);
+        pushReleaseVelWindow(inputRaw, ev.timeStamp);
         // Hardware (mouse and especially pen/tablet) commonly reports a
         // stream of pointermove events even while the hand is essentially
         // motionless — sub-pixel sensor/OS jitter. Only count this sample as
@@ -1231,6 +1272,9 @@ try{
         lastContactPressure: +diag.lastContactPressure.toFixed(3),
         pointerupRawPressure: diag.pointerupRawPressure,
         finishPressure: +diag.finishPressure.toFixed(3),
+        recentVelocityPxMs: diag.recentVelocityPxMs != null ? +diag.recentVelocityPxMs.toFixed(4) : null,
+        flickStrength: diag.flickStrength != null ? +diag.flickStrength.toFixed(3) : null,
+        taperLengthPx: diag.taperLengthPx != null ? +diag.taperLengthPx.toFixed(2) : null,
         finalEmittedPressure: +diag.finalEmittedPressure.toFixed(3),
         finalDabRadius: +diag.finalDabRadius.toFixed(2),
         finalDabAlpha: +diag.finalDabAlpha.toFixed(3),
@@ -1309,6 +1353,54 @@ try{
         recentSpeedPxMs <= HOLD_SPEED_THRESHOLD &&
         brushToAnchorGapPx >= MIN_CATCHUP_GAP;
 
+      // ---- Moving/Flick Release: velocity-aware taper --------------------
+      // Only meaningful for Mode B (Moving Release) — Stationary Hold keeps
+      // its frozen constant-width finish untouched below. Everything here
+      // is geometric (driven by travelled finish-path distance), not a
+      // time-based fade, per the spec: a faster flick must produce a
+      // longer, more visible pressure falloff, not just a quicker one.
+      function smoothstep01(x){
+        const t = Math.max(0, Math.min(1, x));
+        return t * t * (3 - 2 * t);
+      }
+      let taperLengthCanvasPx = 0;
+      let flickStrength = 0;
+      let recentVelocityPxMs = 0;
+      if(!wasStoppedBeforeLift){
+        // Recent raw pen speed (screen-space, zoom-independent), from the
+        // rolling window fed during normal drawing — not the pointerup
+        // event alone, which may be noisy or already slowing down.
+        recentVelocityPxMs = canvasPxToScreenPx(smoothedReleaseVelocityCanvasPxMs);
+
+        const minFlickSpeed = 0.15; // px/ms (~150 px/s) — barely a flick
+        const maxFlickSpeed = 1.6;  // px/ms (~1600 px/s) — a hard flick
+        flickStrength = smoothstep01(
+          (recentVelocityPxMs - minFlickSpeed) / (maxFlickSpeed - minFlickSpeed)
+        );
+
+        const slowTaperLengthPx = 6;   // screen px — short, subtle taper
+        const fastTaperLengthPx = 70;  // screen px — long, clearly visible taper
+        let taperLengthPx = slowTaperLengthPx + (fastTaperLengthPx - slowTaperLengthPx) * flickStrength;
+
+        // Taper length may also scale modestly with brush diameter, but
+        // never dominate — velocity remains the primary driver.
+        const sizeFactor = 0.12;
+        taperLengthPx += getBrushSize() * sizeFactor;
+
+        const MIN_TAPER_PX = 4, MAX_TAPER_PX = 140;
+        taperLengthPx = Math.max(MIN_TAPER_PX, Math.min(MAX_TAPER_PX, taperLengthPx));
+
+        taperLengthCanvasPx = screenPxToCanvasPx(taperLengthPx);
+      }
+      // Monotonic, smooth release envelope: 1 at the start of the taper,
+      // 0 exactly at the true endpoint. progress is travelled finish-path
+      // distance / taperLengthCanvasPx, clamped to [0,1] — geometric, not
+      // time-based, so a fast flick's longer taperLengthCanvasPx produces a
+      // visibly longer narrowing rather than just a faster fade.
+      function releaseEnvelope(progress){
+        return 1 - smoothstep01(progress);
+      }
+
       if(!endpoint || startDist < 0.15){
         // Nothing meaningful to catch up on (stabilization off, or the pen
         // lifted essentially where it was already drawn to).
@@ -1332,6 +1424,9 @@ try{
         wasStoppedBeforeLift,
         stationaryDurationMs,
         recentSpeedPxMsAtLift: recentSpeedPxMs,
+        recentVelocityPxMs,
+        flickStrength,
+        taperLengthPx: taperLengthCanvasPx ? canvasPxToScreenPx(taperLengthCanvasPx) : 0,
         maxCatchUpSpeedPxMs: 0,
         finishDurationMs: 0,
         endpointError: 0,
@@ -1380,6 +1475,33 @@ try{
       // (ticksPerMs); the pressure SOURCE is fixed per-stroke by the mode.
       let tailAlreadyDrawn = false; // guards against a second, disconnected-looking emit
                                      // once the exact endpoint sample has been drawn
+
+      // ---- Moving Release taper placement (velocity controls WHERE the ----
+      // taper sits on the remaining path, not WHETHER the path finishes).
+      // The brush tip must always reach the anchor, TVPaint-style — so the
+      // envelope is compressed into the last taperLengthCanvasPx of the
+      // catch-up path: full finishPressure until travelled reaches
+      // taperStartDist, then a smooth fall to exactly 0 at travelled ===
+      // startDist (the anchor).
+      // taperStartDist = max(0, startDist - taperLengthCanvasPx):
+      //  - fast flick -> longer taperLengthCanvasPx -> smaller
+      //    taperStartDist -> taper begins earlier and covers more of the
+      //    path -> longer, more visible narrowing.
+      //  - slow release -> short taperLengthCanvasPx -> taperStartDist
+      //    close to startDist -> taper only occupies the final sliver of
+      //    the path, starting late and finishing almost immediately.
+      // Either way progress reaches exactly 1 (envelope 0) only when
+      // travelled reaches startDist — i.e. exactly when the brush tip
+      // physically arrives at the anchor.
+      const taperStartDistCanvasPx = wasStoppedBeforeLift
+        ? startDist // unused for Stationary Hold, but keeps the var defined
+        : Math.max(0, startDist - taperLengthCanvasPx);
+      function movingReleasePressureAt(travelled){
+        const span = Math.max(1e-4, startDist - taperStartDistCanvasPx);
+        const progress = Math.min(1, Math.max(0, (travelled - taperStartDistCanvasPx) / span));
+        return finishPressure * releaseEnvelope(progress);
+      }
+
       function finishTick(t){
         finishRAF = null;
         const now = Number.isFinite(t) ? t : performance.now();
@@ -1390,11 +1512,14 @@ try{
 
         if(remaining <= 0.15 || smoothBuf.length === 0){
           if(!tailAlreadyDrawn){
-            // Final sample: position lands exactly on the true endpoint.
-            // Pressure source depends on the finish mode determined at
-            // pointer-up — frozen for Stationary Hold, drained real
-            // history for Moving Release.
-            const finalPressure = wasStoppedBeforeLift ? finishPressure : drainPressureBuf();
+            // Final sample: position always lands exactly on the true
+            // endpoint/anchor, for both modes. Pressure source:
+            //  - Stationary Hold: frozen finishPressure.
+            //  - Moving Release: the compressed envelope evaluated at
+            //    travelled === startDist, which is 0 by construction —
+            //    the taper's own natural end, not a forced/artificial zero,
+            //    and it lands exactly where the brush tip lands.
+            const finalPressure = wasStoppedBeforeLift ? finishPressure : movingReleasePressureAt(startDist);
             const all = [];
             feedPoint(all, endpoint, finalPressure);
             if(all.length){
@@ -1431,9 +1556,19 @@ try{
 
           // Pressure source depends on the finish mode determined once at
           // pointer-up (wasStoppedBeforeLift): frozen constant for
-          // Stationary Hold, drained real history for Moving Release.
-          // Either way, no new value is ever injected during finish.
-          const emittedPressure = wasStoppedBeforeLift ? finishPressure : drainPressureBuf();
+          // Stationary Hold. For Moving Release, the envelope is a function
+          // of travelled finish-path distance (not elapsed time), always
+          // reaching 0 exactly when travelled === startDist — i.e. exactly
+          // when the brush tip arrives at the anchor. Nothing ever stops
+          // being fed to feedPoint before the anchor is reached.
+          let emittedPressure;
+          if(wasStoppedBeforeLift){
+            emittedPressure = finishPressure;
+          } else {
+            const remainingNow = Math.hypot(endpoint.x - caught.x, endpoint.y - caught.y);
+            const travelled = Math.max(0, startDist - remainingNow);
+            emittedPressure = movingReleasePressureAt(travelled);
+          }
 
           if(diag.frames.length < 60){
             diag.frames.push({
