@@ -850,6 +850,20 @@ try{
       for(const v of pressureBuf) s += v;
       return s / pressureBuf.length;
     }
+    // Dequeue-only companion to pushPressureBuf: used ONLY during Moving
+    // Release finish (see endStroke). It never injects a new sample — it
+    // just lets the buffer's already-recorded real pressure history keep
+    // aging out one sample per tick, the same way pushSmoothBuf's position
+    // window keeps shifting. This is what reproduces a genuine pointed
+    // ending on a fast flick: whatever real decaying pressure was already
+    // captured during drawing continues to play out, never a frozen
+    // scalar and never a fabricated envelope.
+    function drainPressureBuf(){
+      if(pressureBuf.length > 1) pressureBuf.shift();
+      let s = 0;
+      for(const v of pressureBuf) s += v;
+      return s / pressureBuf.length;
+    }
     let lastInputRaw = null;
     let lastInputPressure = 0;
 
@@ -1027,6 +1041,11 @@ try{
     // Feeds one point through the midpoint-quadratic curve fitter and
     // advances lastMid/prevRaw/lastRaw. Factored out so moveStroke can call
     // it multiple times per real sample (see subdivision below).
+    // TEMPORARY DIAGNOSTIC (pairing verification only — remove after confirming):
+    // Records every feedPoint call so the final one (immediately before
+    // pointerup) can be inspected to confirm raw/pressure/radius all came
+    // from the same tick, and that delayedPressure at call time matches
+    // the pressure argument actually passed in.
     function feedPoint(all, raw, pressure){
       strokeMoved = true;
       const r = pressureRadius(getBrushSize(), pressure);
@@ -1202,13 +1221,16 @@ try{
 
     function logFinishDiagnostics(diag){
       console.log('[stabilizer finish]', {
+        mode: diag.wasStoppedBeforeLift ? 'STATIONARY_HOLD' : 'MOVING_RELEASE',
+        stationaryDurationMs: Math.round(diag.stationaryDurationMs),
+        recentSpeedPxMsAtLift: +diag.recentSpeedPxMsAtLift.toFixed(4),
         finishDurationMs: Math.round(diag.finishDurationMs),
         maxCatchUpSpeedPxPerMs: +diag.maxCatchUpSpeedPxMs.toFixed(3),
         startGapPx: +diag.startDist.toFixed(2),
         endpointErrorPx: +diag.endpointError.toFixed(4),
         lastContactPressure: +diag.lastContactPressure.toFixed(3),
         pointerupRawPressure: diag.pointerupRawPressure,
-        targetPressure: +diag.targetPressure.toFixed(3),
+        finishPressure: +diag.finishPressure.toFixed(3),
         finalEmittedPressure: +diag.finalEmittedPressure.toFixed(3),
         finalDabRadius: +diag.finalDabRadius.toFixed(2),
         finalDabAlpha: +diag.finalDabAlpha.toFixed(3),
@@ -1228,7 +1250,20 @@ try{
         cancelAnimationFrame(finishRAF);
         finishRAF = null;
       }
+
+      // ---- Capture finish pressure from the brush tip, not the anchor ----
+      // Must happen AFTER flushPendingStrokeSamples(): on a fast stroke,
+      // several real pointermove samples are often still queued at the
+      // moment pointerup fires (coalesced/batched, rendered once per
+      // frame). Those are genuine drawing data — flushing them lets any
+      // real trailing pressure decrease (fast lift-off) show up honestly.
+      // This is still safe from anchor/pointer-up contamination: pointerup
+      // never calls moveStroke, so its own (often near-zero) pressure
+      // value never enters processStrokeBatch/pressureBuf either way —
+      // capturing after flush only picks up real queued samples, never
+      // the pointerup event itself.
       flushPendingStrokeSamples();
+      const finishPressure = delayedPressure;
       drawing = false;
 
       if(!(strokeMoved && lastMid && lastRaw)){
@@ -1240,35 +1275,45 @@ try{
       const endpoint = e && Number.isFinite(e.clientX) && Number.isFinite(e.clientY)
         ? screenToCanvas(e.clientX, e.clientY) : lastInputRaw;
 
-      // ---- Symmetric finish: no synthetic release taper -----------------
-      // Position and pressure are two moving-average buffers fed in
-      // lockstep during drawing (pushSmoothBuf / pushPressureBuf). The
-      // finish stage must preserve that symmetry: freeze a single target
-      // sample at pointer-up (the true endpoint position, and the pressure
-      // that was actually being held there) and keep pushing that SAME
-      // frozen target into BOTH buffers every tick, exactly like
-      // strokeHoldTick already does for "pen held down but stationary".
-      // The stroke ends naturally once the position buffer converges —
-      // there is no separate pressure curve, no envelope, nothing
-      // invented after pointer-up. Whatever shape pressure takes here is
-      // just the tail end of pressureBuf's own real history aging out.
+      // ---- Two finish modes -------------------------------------------
+      // Mode A (Stationary Hold): the raw pen genuinely stopped before
+      // pointer-up while the stabilized tip was still catching up.
+      // Pressure freezes at finishPressure (captured above) — constant,
+      // rounded finish, no taper.
+      // Mode B (Moving Release): the pen was still moving at pointer-up.
+      // Pressure must NOT freeze — it continues draining from its own
+      // already-recorded real history (drainPressureBuf), reproducing the
+      // natural pointed ending a fast flick had before any of this finish
+      // logic ever ran.
       //
-      // Freezing lastContactPressure (not delayedPressure) as the target
-      // matters: lastContactPressure is filtered to ignore trailing
-      // near-zero release-artifact samples, so it reflects genuine "still
-      // pressing" pressure. delayedPressure is a moving average that may
-      // already contain those decaying release samples, which would bake
-      // fabricated fade into what's supposed to be raw replay.
-      const targetPressure = lastContactPressure;
+      // Classification uses rolling/smoothed signals, not the final
+      // sample alone, so a brief slowdown mid-flick can't be mistaken for
+      // a genuine stop:
+      //  - recentSpeedPxMs is already exponentially smoothed (see
+      //    trackVelocity) and only decays toward zero over real elapsed
+      //    idle time (see strokeHoldTick) — one slow sample can't collapse it.
+      //  - stationaryDurationMs comes from lastMoveEventTime, which only
+      //    advances when a real sample exceeds the jitter floor — so it
+      //    reflects genuine dwell, not per-event noise.
       const pointerupRawPressure = e && typeof e.pressure === 'number' ? e.pressure : null;
 
       const startDist = endpoint ? Math.hypot(endpoint.x - lastRaw.x, endpoint.y - lastRaw.y) : 0;
+
+      const HOLD_SPEED_THRESHOLD = 0.03; // px/ms (~30 px/s) — effectively stopped
+      const HOLD_DWELL_MS = 150;         // must have been still for this long
+      const MIN_CATCHUP_GAP = 1.5;       // px — brush tip must still be meaningfully behind
+      const stationaryDurationMs = performance.now() - lastMoveEventTime;
+      const brushToAnchorGapPx = startDist;
+      const wasStoppedBeforeLift =
+        stationaryDurationMs >= HOLD_DWELL_MS &&
+        recentSpeedPxMs <= HOLD_SPEED_THRESHOLD &&
+        brushToAnchorGapPx >= MIN_CATCHUP_GAP;
 
       if(!endpoint || startDist < 0.15){
         // Nothing meaningful to catch up on (stabilization off, or the pen
         // lifted essentially where it was already drawn to).
         const all = [];
-        if(endpoint) feedPoint(all, endpoint, targetPressure);
+        if(endpoint) feedPoint(all, endpoint, finishPressure);
         if(all.length){
           const arr = new Float32Array(all);
           drawVertsIntoAcc(arr, arr.length / 9, colorRgb, tool === 'eraser');
@@ -1281,16 +1326,19 @@ try{
       const diag = {
         startTime: performance.now(),
         startDist,
-        targetPressure,
+        finishPressure,
         pointerupRawPressure,
         lastContactPressure,
+        wasStoppedBeforeLift,
+        stationaryDurationMs,
+        recentSpeedPxMsAtLift: recentSpeedPxMs,
         maxCatchUpSpeedPxMs: 0,
         finishDurationMs: 0,
         endpointError: 0,
         finalDabRadius: 0,
         finalDabAlpha: 0,
         ticksEmitted: 0,
-        frames: [] // per-frame trace: position/pressure buffer drain, for validation
+        frames: [] // per-frame trace: position buffer drain, for validation
       };
       let lastTickTime = diag.startTime;
 
@@ -1319,13 +1367,17 @@ try{
       const endRatePerMs = avgTicksPerMs * 1.6;
 
       // Accelerated Finish Line. Every tick still advances the exact same
-      // position AND pressure moving-average buffers used during normal
-      // drawing (pushSmoothBuf / pushPressureBuf) — this is what keeps the
-      // finish following the real stabilized trajectory instead of a
-      // shortcut straight line, and keeps pressure a genuine replay of
-      // held history instead of an invented curve. What changes at
-      // release is only the drain RATE (ticksPerMs), not the values being
-      // drained toward.
+      // position moving-average buffer used during normal drawing
+      // (pushSmoothBuf) — this is what keeps the finish following the real
+      // stabilized trajectory instead of a shortcut straight line.
+      // Pressure source depends on wasStoppedBeforeLift (computed above):
+      //  - Stationary Hold: finishPressure, frozen, same value every tick.
+      //  - Moving Release: drainPressureBuf(), which lets the already-
+      //    recorded real pressure history keep aging out one sample per
+      //    tick — no injection, no freeze, reproduces the natural pointed
+      //    ending a fast flick had before finish-phase logic existed.
+      // What changes with playback speed is only the position drain RATE
+      // (ticksPerMs); the pressure SOURCE is fixed per-stroke by the mode.
       let tailAlreadyDrawn = false; // guards against a second, disconnected-looking emit
                                      // once the exact endpoint sample has been drawn
       function finishTick(t){
@@ -1338,10 +1390,11 @@ try{
 
         if(remaining <= 0.15 || smoothBuf.length === 0){
           if(!tailAlreadyDrawn){
-            // Final sample: push the frozen target into both buffers one
-            // last time so pressure is computed the same way every other
-            // tick was, then land exactly on the true endpoint position.
-            const finalPressure = pushPressureBuf(targetPressure);
+            // Final sample: position lands exactly on the true endpoint.
+            // Pressure source depends on the finish mode determined at
+            // pointer-up — frozen for Stationary Hold, drained real
+            // history for Moving Release.
+            const finalPressure = wasStoppedBeforeLift ? finishPressure : drainPressureBuf();
             const all = [];
             feedPoint(all, endpoint, finalPressure);
             if(all.length){
@@ -1376,9 +1429,11 @@ try{
           if(stepSpeed > diag.maxCatchUpSpeedPxMs) diag.maxCatchUpSpeedPxMs = stepSpeed;
           diag.ticksEmitted++;
 
-          // Pressure drains from its own moving-average buffer in lockstep
-          // with position — same tick, same frozen target, no envelope.
-          const emittedPressure = pushPressureBuf(targetPressure);
+          // Pressure source depends on the finish mode determined once at
+          // pointer-up (wasStoppedBeforeLift): frozen constant for
+          // Stationary Hold, drained real history for Moving Release.
+          // Either way, no new value is ever injected during finish.
+          const emittedPressure = wasStoppedBeforeLift ? finishPressure : drainPressureBuf();
 
           if(diag.frames.length < 60){
             diag.frames.push({
@@ -1387,8 +1442,8 @@ try{
             });
           }
 
-          // Position and pressure come from the same tick, drained from
-          // parallel buffers, so they can never drift out of sync.
+          // Position converges toward the anchor; pressure is the frozen
+          // brush-tip value. Same tick, so they can never drift apart.
           feedPoint(all, caught, emittedPressure);
         }
         if(all.length){
