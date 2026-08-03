@@ -845,6 +845,14 @@ try{
     let lastMoveEventTime = 0;
     let pressureBuf = [];
     let delayedPressure = 0;
+    // Temporary cadence-invariant diagnostics: every tick that advances
+    // smoothBuf (position) must advance pressureBuf (pressure) exactly
+    // once too, or FIFO drain during finish pairs a delayed position with
+    // a pressure sample from a different point in the stroke. Reset at
+    // beginStroke, incremented at every real advance site, compared and
+    // logged at pointer-up before finish begins.
+    let positionBufferAdvanceCount = 0;
+    let pressureBufferAdvanceCount = 0;
     // Mirrors pushSmoothBuf's windowing exactly, but for pressure instead of
     // position. This gives a "stabilized pressure" value that corresponds to
     // the delayed brush position (lastRaw), not the live/raw pen reading —
@@ -858,20 +866,12 @@ try{
       for(const v of pressureBuf) s += v;
       return s / pressureBuf.length;
     }
-    // Dequeue-only companion to pushPressureBuf: used ONLY during Moving
-    // Release finish (see endStroke). It never injects a new sample — it
-    // just lets the buffer's already-recorded real pressure history keep
-    // aging out one sample per tick, the same way pushSmoothBuf's position
-    // window keeps shifting. This is what reproduces a genuine pointed
-    // ending on a fast flick: whatever real decaying pressure was already
-    // captured during drawing continues to play out, never a frozen
-    // scalar and never a fabricated envelope.
-    function drainPressureBuf(){
-      if(pressureBuf.length > 1) pressureBuf.shift();
-      let s = 0;
-      for(const v of pressureBuf) s += v;
-      return s / pressureBuf.length;
-    }
+    // drainPressureBuf() was removed: finish no longer uses a separate FIFO
+    // algorithm. Finish pressure is produced by pushPressureBuf() — the
+    // exact same moving-average filter used during live drawing — fed the
+    // held real boundary value (finishPressure) every tick, mirroring how
+    // endpoint (a held real position) is fed into pushSmoothBuf() every
+    // finish tick. See endStroke/finishTick for the call sites.
     let lastInputRaw = null;
     let lastInputPressure = 0;
 
@@ -1049,6 +1049,8 @@ try{
       delayedPressure = startPressure;
       lastInputPressure = startPressure;
       lastContactPressure = startPressure;
+      positionBufferAdvanceCount = 0;
+      pressureBufferAdvanceCount = 0;
       recentSpeedPxMs = 0;
       lastVelRaw = p;
       lastVelTime = performance.now();
@@ -1159,7 +1161,9 @@ try{
         // release (tip lifting off) must not overwrite it.
         if(pressure > CONTACT_PRESSURE_FLOOR) lastContactPressure = pressure;
         delayedPressure = pushPressureBuf(pressure);
+        pressureBufferAdvanceCount++;
         const raw = pushSmoothBuf(inputRaw);
+        positionBufferAdvanceCount++;
         const jumpDx = raw.x - lastRaw.x, jumpDy = raw.y - lastRaw.y;
         const jumpDist = Math.hypot(jumpDx, jumpDy);
         if(jumpDist > maxStep){
@@ -1256,6 +1260,18 @@ try{
         let raw = null;
         for(let i = 0; i < ticks; i++){
           raw = pushSmoothBuf(lastInputRaw);
+          positionBufferAdvanceCount++;
+          // The anchor position and its held pressure are a legitimate
+          // repeated real input while the pen is stationary — this is
+          // NOT a synthetic pressure value. lastInputPressure is the
+          // exact real sample most recently paired with lastInputRaw
+          // (set alongside it in processStrokeBatch), so re-pushing it
+          // here keeps pressureBuf advancing exactly once per position
+          // advance on every iteration, including the one that breaks
+          // below — the cadence invariant must hold regardless of
+          // whether that tick's position happens to be emitted.
+          delayedPressure = pushPressureBuf(lastInputPressure);
+          pressureBufferAdvanceCount++;
           const dx = raw.x - lastRaw.x, dy = raw.y - lastRaw.y;
           if(Math.hypot(dx, dy) <= 1e-4) break;
           feedPoint(all, raw, delayedPressure);
@@ -1289,10 +1305,12 @@ try{
 
     function logFinishDiagnostics(diag){
       // NOTE: no "mode" field anymore — there is only one finish path.
-      // Pressure during finish always comes from drainPressureBuf(); it is
-      // never classified as a stationary-hold vs. moving-release case, and
-      // there is no flick strength or taper length to report because
-      // nothing here synthesizes pressure from velocity or distance.
+      // Pressure during finish always comes from pushPressureBuf(finishPressure)
+      // — the same moving-average filter used during live drawing, fed the
+      // held real boundary value. It is never classified as a
+      // stationary-hold vs. moving-release case, and there is no flick
+      // strength or taper length to report because nothing here
+      // synthesizes pressure from velocity or distance.
       console.log('[stabilizer finish]', {
         recentSpeedPxMsAtLift: +diag.recentSpeedPxMsAtLift.toFixed(4),
         finishDurationMs: Math.round(diag.finishDurationMs),
@@ -1334,8 +1352,32 @@ try{
       // capturing after flush only picks up real queued samples, never
       // the pointerup event itself.
       flushPendingStrokeSamples();
-      const finishPressure = delayedPressure;
+      // Held boundary value for the finish tail: the last legitimate REAL
+      // input sample (paired with lastInputRaw in processStrokeBatch/
+      // strokeHoldTick), not the already-filtered delayedPressure. This is
+      // fed into pushPressureBuf() every finish tick the same way endpoint
+      // (a raw position, not a filtered one) is fed into pushSmoothBuf()
+      // every finish tick — constant-extension of the real input stream,
+      // not a re-filter of already-filtered output.
+      const finishPressure = lastInputPressure;
       drawing = false;
+
+      // ---- Cadence invariant check --------------------------------------
+      // positionBufferAdvanceCount and pressureBufferAdvanceCount must be
+      // equal at this point: every tick that advanced smoothBuf (real
+      // samples, coalesced samples, and strokeHoldTick's held-still catch
+      // up) must have advanced pressureBuf exactly once too, or FIFO drain
+      // during finish pairs a delayed position with a pressure sample from
+      // a different point in the stroke.
+      const cadenceDelta = positionBufferAdvanceCount - pressureBufferAdvanceCount;
+      console.log('[stabilizer cadence]', {
+        positionBufferAdvanceCount,
+        pressureBufferAdvanceCount,
+        cadenceDelta
+      });
+      if(cadenceDelta !== 0){
+        console.warn('[stabilizer cadence] MISMATCH — position/pressure buffers desynced by', cadenceDelta, 'ticks; FIFO finish replay will pair mismatched ages.');
+      }
 
       if(!(strokeMoved && lastMid && lastRaw)){
         clearStabViz();
@@ -1346,20 +1388,23 @@ try{
       const endpoint = e && Number.isFinite(e.clientX) && Number.isFinite(e.clientY)
         ? screenToCanvas(e.clientX, e.clientY) : lastInputRaw;
 
-      // ---- Finish pressure: real history only, no synthesis --------------
-      // The stabilizer owns POSITION ONLY. During finish, position keeps
-      // catching up toward the frozen endpoint (unchanged below), but
-      // pressure is never computed from release progress, finish distance,
-      // endpoint distance, flick speed, taper length, elapsed time, or
-      // stabilization amount. The only pressure source is drainPressureBuf():
-      // it dequeues at most one already-recorded real sample per finish
-      // tick (see its definition above) and returns the average of what
-      // remains, never falling below one real remaining sample and never
-      // having a new sample injected. If the artist's real pressure was
-      // constant up to lift, the buffer is full of that same constant value
-      // and stays constant. If the artist genuinely eased off before
-      // lifting, that recorded decrease is what naturally plays out here —
-      // this code never decides that decrease itself.
+      // ---- Finish pressure: same filter, held real boundary value --------
+      // Position and pressure share one architecture end-to-end: both are
+      // outputs of a moving-average filter (pushSmoothBuf / pushPressureBuf)
+      // that keeps running, unchanged, straight through pointer-up. Only the
+      // INPUT to that filter becomes constant once real samples stop:
+      // position is fed the frozen endpoint every tick, pressure is fed
+      // finishPressure (the last legitimate real pressure sample) every
+      // tick. Pressure is never computed from release progress, finish
+      // distance, endpoint distance, flick speed, taper length, elapsed
+      // time, or stabilization amount — and it is never produced by a
+      // second, different algorithm (no FIFO drain). If the artist's real
+      // pressure was constant up to lift, the window fills with that
+      // constant and the output stays constant. If the artist eased off
+      // before lifting, the already-recorded decrease still in the window
+      // continues to average out smoothly as fresh finishPressure values
+      // enter and old samples age out — this code never decides that
+      // decrease itself.
       const pointerupRawPressure = e && typeof e.pressure === 'number' ? e.pressure : null;
 
       const startDist = endpoint ? Math.hypot(endpoint.x - lastRaw.x, endpoint.y - lastRaw.y) : 0;
@@ -1429,13 +1474,16 @@ try{
       // position moving-average buffer used during normal drawing
       // (pushSmoothBuf) — this is what keeps the finish following the real
       // stabilized trajectory instead of a shortcut straight line.
-      // Pressure, every tick, comes only from drainPressureBuf() — the
-      // already-recorded real pressure history aging out one sample per
-      // tick, exactly like the position buffer ages out one position per
-      // tick. No mode switch, no envelope, no frozen scalar computed from
-      // geometry: what changes with playback speed is only the position
-      // drain RATE (ticksPerMs); the pressure buffer drains once per tick
-      // regardless.
+      // Pressure, every tick, comes from the SAME moving-average buffer
+      // used during normal drawing (pushPressureBuf) — never a different
+      // algorithm. The live phase never had a "new real pressure sample"
+      // to feed in either; it always fed whatever the pointer reported at
+      // that instant. During finish there is no new pointer reading, so
+      // the constant-extension boundary value (finishPressure, the last
+      // real sample) is fed in every tick instead — exactly mirroring how
+      // endpoint (a constant, not a new real position) is fed into
+      // pushSmoothBuf every tick. Same filter, same window, same shift-out
+      // cadence, on both channels, for the entire stroke including finish.
       let tailAlreadyDrawn = false; // guards against a second, disconnected-looking emit
                                      // once the exact endpoint sample has been drawn
 
@@ -1458,10 +1506,11 @@ try{
         if(remaining <= 0.15 || smoothBuf.length === 0){
           if(!tailAlreadyDrawn){
             // Final sample: position always lands exactly on the true
-            // endpoint/anchor. Pressure: one more real drain, never a
-            // manufactured zero and never re-derived from where the
-            // position landed.
-            const finalPressure = drainPressureBuf();
+            // endpoint/anchor. Pressure: one more evaluation of the same
+            // moving-average filter used everywhere else, fed the same
+            // held boundary value — never a manufactured zero and never
+            // re-derived from where the position landed.
+            const finalPressure = pushPressureBuf(finishPressure);
             const all = [];
             feedPoint(all, endpoint, finalPressure);
             if(all.length){
@@ -1496,9 +1545,11 @@ try{
           if(stepSpeed > diag.maxCatchUpSpeedPxMs) diag.maxCatchUpSpeedPxMs = stepSpeed;
           diag.ticksEmitted++;
 
-          // Pressure: one real recorded sample drained per tick — never a
-          // function of travelled distance, elapsed time, or velocity.
-          const emittedPressure = drainPressureBuf();
+          // Pressure: one evaluation of the same moving-average filter
+          // used during live drawing, fed the held real boundary sample —
+          // never a function of travelled distance, elapsed time, or
+          // velocity, and never a different algorithm than live drawing.
+          const emittedPressure = pushPressureBuf(finishPressure);
 
           if(diag.frames.length < 60){
             diag.frames.push({
@@ -1507,9 +1558,10 @@ try{
             });
           }
 
-          // Position converges toward the anchor; pressure is drained from
-          // real history. Same tick, so they can never drift apart, but
-          // they are computed from entirely independent sources.
+          // Position and pressure both converge via the same moving-average
+          // filter, fed their respective held boundary values (endpoint /
+          // finishPressure) every tick — the same tick, so they can never
+          // drift apart, and now the same algorithm as live drawing too.
           feedPoint(all, caught, emittedPressure);
         }
         if(all.length){
