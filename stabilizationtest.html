@@ -843,6 +843,10 @@ try{
     // claim about Lazy Nezumi's proprietary implementation.
     let smoothBuf = [];
     let lastMoveEventTime = 0;
+    // How long (ms) with no real movement beyond the jitter floor before the
+    // anchor is considered "stopped" for finish-pressure-mode purposes. See
+    // computeWasStoppedBeforeLift() / endStroke for how this is used.
+    const HOLD_BEFORE_LIFT_MS = 120;
     let pressureBuf = [];
     let delayedPressure = 0;
     // Temporary cadence-invariant diagnostics: every tick that advances
@@ -1303,15 +1307,47 @@ try{
       recentSpeedPxMs = 0;
     }
 
+    // ---- Stationary-vs-moving release detection -------------------------
+    // Decides which of the two finish-pressure modes applies. Must be
+    // evaluated BEFORE flushPendingStrokeSamples() touches any buffers,
+    // because:
+    //   1. lastMoveEventTime only reflects samples already processed by
+    //      processStrokeBatch/strokeHoldTick — any queued-but-unprocessed
+    //      samples in pendingStrokeSamples haven't updated it yet, so they
+    //      must be checked directly here.
+    //   2. Stationary Hold must snapshot delayedPressure before any flush
+    //      can run pushPressureBuf and change it.
+    // A queued sample only counts as "real movement" (not just idle-hand
+    // sensor jitter) if it moves more than the same JITTER_FLOOR_PX used
+    // in processStrokeBatch's own held-before-lift bookkeeping.
+    function computeWasStoppedBeforeLift(){
+      if(!lastInputRaw) return false;
+      if(pendingStrokeSamples.length){
+        const JITTER_FLOOR_PX = 1.5 * zoomSmoothingFactor();
+        for(const s of pendingStrokeSamples){
+          const p = screenToCanvas(s.clientX, s.clientY);
+          if(Math.hypot(p.x - lastInputRaw.x, p.y - lastInputRaw.y) > JITTER_FLOOR_PX){
+            return false; // still-unprocessed real movement — not stopped
+          }
+        }
+      }
+      return (performance.now() - lastMoveEventTime) >= HOLD_BEFORE_LIFT_MS;
+    }
+
     function logFinishDiagnostics(diag){
-      // NOTE: no "mode" field anymore — there is only one finish path.
-      // Pressure during finish always comes from pushPressureBuf(finishPressure)
-      // — the same moving-average filter used during live drawing, fed the
-      // held real boundary value. It is never classified as a
-      // stationary-hold vs. moving-release case, and there is no flick
-      // strength or taper length to report because nothing here
-      // synthesizes pressure from velocity or distance.
+      // Two finish-pressure modes (see endStroke):
+      //  - "stationary-hold": finishPressure is a single frozen snapshot of
+      //    delayedPressure taken at pointer-up; it is reused, unchanged, for
+      //    every catch-up sample and the final endpoint sample.
+      //    pushPressureBuf() is never called during this finish.
+      //  - "moving-release": unchanged prior architecture — every finish
+      //    tick calls pushPressureBuf(finishPressure) (finishPressure ==
+      //    the last real input pressure sample), i.e. the same
+      //    moving-average filter used during live drawing.
+      // There is still no flick strength or taper length to report because
+      // nothing here synthesizes pressure from velocity or distance.
       console.log('[stabilizer finish]', {
+        mode: diag.mode,
         recentSpeedPxMsAtLift: +diag.recentSpeedPxMsAtLift.toFixed(4),
         finishDurationMs: Math.round(diag.finishDurationMs),
         maxCatchUpSpeedPxPerMs: +diag.maxCatchUpSpeedPxMs.toFixed(3),
@@ -1340,27 +1376,54 @@ try{
         finishRAF = null;
       }
 
-      // ---- Capture finish pressure from the brush tip, not the anchor ----
-      // Must happen AFTER flushPendingStrokeSamples(): on a fast stroke,
-      // several real pointermove samples are often still queued at the
-      // moment pointerup fires (coalesced/batched, rendered once per
-      // frame). Those are genuine drawing data — flushing them lets any
-      // real trailing pressure decrease (fast lift-off) show up honestly.
-      // This is still safe from anchor/pointer-up contamination: pointerup
-      // never calls moveStroke, so its own (often near-zero) pressure
-      // value never enters processStrokeBatch/pressureBuf either way —
-      // capturing after flush only picks up real queued samples, never
-      // the pointerup event itself.
-      flushPendingStrokeSamples();
-      // Held boundary value for the finish tail: the last legitimate REAL
-      // input sample (paired with lastInputRaw in processStrokeBatch/
-      // strokeHoldTick), not the already-filtered delayedPressure. This is
-      // fed into pushPressureBuf() every finish tick the same way endpoint
-      // (a raw position, not a filtered one) is fed into pushSmoothBuf()
-      // every finish tick — constant-extension of the real input stream,
-      // not a re-filter of already-filtered output.
-      const finishPressure = lastInputPressure;
+      // ---- Determine finish-pressure mode BEFORE any flush -------------
+      // wasStoppedBeforeLift must be computed, and (for Stationary Hold)
+      // finishPressure must be snapshotted, before flushPendingStrokeSamples()
+      // runs — flushing calls pushPressureBuf() internally, which would
+      // otherwise change delayedPressure out from under us.
+      const wasStoppedBeforeLift = computeWasStoppedBeforeLift();
+
+      let finishPressure;
+      if(wasStoppedBeforeLift){
+        // ---- Stationary Hold ---------------------------------------------
+        // The anchor was genuinely idle before lift: freeze the brush tip's
+        // CURRENT delayed pressure right now, before anything else can run.
+        // Any samples still sitting in pendingStrokeSamples at this point
+        // are, by computeWasStoppedBeforeLift()'s own check, movement-free
+        // (jitter only) — they are discarded rather than flushed so that no
+        // pushPressureBuf() call (and no pressure-history drain/replay of
+        // any kind) happens anywhere in this finish.
+        finishPressure = delayedPressure;
+        pendingStrokeSamples = [];
+      } else {
+        // ---- Moving Release ------------------------------------------------
+        // Unchanged prior architecture: flush any queued real samples first
+        // (fast strokes often still have coalesced pointermove samples
+        // queued when pointerup fires), then hold the last real input
+        // pressure as the constant-extension boundary value fed into
+        // pushPressureBuf() every finish tick — exactly mirroring how
+        // endpoint (a raw position, not a filtered one) is fed into
+        // pushSmoothBuf() every finish tick. This is still safe from
+        // anchor/pointer-up contamination: pointerup never calls
+        // moveStroke, so its own (often near-zero) pressure value never
+        // enters processStrokeBatch/pressureBuf either way.
+        flushPendingStrokeSamples();
+        finishPressure = lastInputPressure;
+      }
       drawing = false;
+
+      // Single choke point every finish-pressure sample below must go
+      // through, so Stationary Hold and Moving Release can never
+      // accidentally diverge between the shortcut branch, the main finish
+      // loop, and the final endpoint sample:
+      //  - Stationary Hold: always returns the frozen finishPressure,
+      //    unchanged — no pushPressureBuf() call, ever.
+      //  - Moving Release: calls pushPressureBuf(finishPressure) — the same
+      //    moving-average filter used during live drawing — once per finish
+      //    tick, exactly as before.
+      function nextFinishPressure(){
+        return wasStoppedBeforeLift ? finishPressure : pushPressureBuf(finishPressure);
+      }
 
       // ---- Cadence invariant check --------------------------------------
       // positionBufferAdvanceCount and pressureBufferAdvanceCount must be
@@ -1413,7 +1476,7 @@ try{
         // Nothing meaningful to catch up on (stabilization off, or the pen
         // lifted essentially where it was already drawn to).
         const all = [];
-        if(endpoint) feedPoint(all, endpoint, finishPressure);
+        if(endpoint) feedPoint(all, endpoint, nextFinishPressure());
         if(all.length){
           const arr = new Float32Array(all);
           drawVertsIntoAcc(arr, arr.length / 9, colorRgb, tool === 'eraser');
@@ -1424,6 +1487,7 @@ try{
       }
 
       const diag = {
+        mode: wasStoppedBeforeLift ? 'stationary-hold' : 'moving-release',
         startTime: performance.now(),
         startDist,
         finishPressure,
@@ -1473,17 +1537,22 @@ try{
       // Accelerated Finish Line. Every tick still advances the exact same
       // position moving-average buffer used during normal drawing
       // (pushSmoothBuf) — this is what keeps the finish following the real
-      // stabilized trajectory instead of a shortcut straight line.
-      // Pressure, every tick, comes from the SAME moving-average buffer
-      // used during normal drawing (pushPressureBuf) — never a different
-      // algorithm. The live phase never had a "new real pressure sample"
-      // to feed in either; it always fed whatever the pointer reported at
-      // that instant. During finish there is no new pointer reading, so
-      // the constant-extension boundary value (finishPressure, the last
-      // real sample) is fed in every tick instead — exactly mirroring how
-      // endpoint (a constant, not a new real position) is fed into
-      // pushSmoothBuf every tick. Same filter, same window, same shift-out
-      // cadence, on both channels, for the entire stroke including finish.
+      // stabilized trajectory instead of a shortcut straight line, in BOTH
+      // finish-pressure modes; the anchor controls position only.
+      //
+      // Pressure comes from nextFinishPressure(), which is mode-dependent:
+      //  - Moving Release: every tick calls pushPressureBuf(finishPressure)
+      //    — the SAME moving-average buffer used during normal drawing,
+      //    never a different algorithm. The live phase never had a "new
+      //    real pressure sample" to feed in either; it always fed whatever
+      //    the pointer reported at that instant. During finish there is no
+      //    new pointer reading, so the constant-extension boundary value
+      //    (finishPressure, the last real sample) is fed in every tick
+      //    instead — exactly mirroring how endpoint (a constant, not a new
+      //    real position) is fed into pushSmoothBuf every tick.
+      //  - Stationary Hold: pushPressureBuf() is never called; every tick
+      //    reuses the single finishPressure snapshot taken at pointer-up
+      //    unchanged, so the remaining catch-up can never thin out.
       let tailAlreadyDrawn = false; // guards against a second, disconnected-looking emit
                                      // once the exact endpoint sample has been drawn
 
@@ -1510,7 +1579,7 @@ try{
             // moving-average filter used everywhere else, fed the same
             // held boundary value — never a manufactured zero and never
             // re-derived from where the position landed.
-            const finalPressure = pushPressureBuf(finishPressure);
+            const finalPressure = nextFinishPressure();
             const all = [];
             feedPoint(all, endpoint, finalPressure);
             if(all.length){
@@ -1549,7 +1618,7 @@ try{
           // used during live drawing, fed the held real boundary sample —
           // never a function of travelled distance, elapsed time, or
           // velocity, and never a different algorithm than live drawing.
-          const emittedPressure = pushPressureBuf(finishPressure);
+          const emittedPressure = nextFinishPressure();
 
           if(diag.frames.length < 60){
             diag.frames.push({
