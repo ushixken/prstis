@@ -294,6 +294,14 @@ try{
   let hovering = false;
   let previewSuppressedUntilMove = false;
   let chaseRAF = null;
+  // Monotonic stroke-session token. Every beginStroke() mints a new one and
+  // stores it as the active session. Any async callback belonging to a
+  // stroke (finish loop, hold/catch-up loop, etc.) captures the token that
+  // was active when it was scheduled and must re-check it against the
+  // current active token before touching shared mutable stroke state — see
+  // REQUIRED OWNERSHIP RULE in the stabilizer lifecycle investigation.
+  let nextStrokeSessionId = 0;
+  let activeStrokeSessionId = 0;
   const undoStack = [];
   const redoStack = [];
   const MAX_UNDO = 12;
@@ -1029,6 +1037,23 @@ try{
 
     beginStroke = function(e){
       if(chaseRAF){ cancelAnimationFrame(chaseRAF); chaseRAF = null; }
+      // ---- New-stroke policy: invalidate + cancel the previous stroke's
+      // async finish/catch-up work BEFORE any shared stroke state below is
+      // reset. If a fast lift-then-redraw happens while the previous
+      // stroke's finishTick RAF is still pending, that callback would
+      // otherwise fire on the next frame and read/mutate lastRaw, lastMid,
+      // smoothBuf, lastR, lastAlpha, endpoint, finishPressure, etc. after
+      // they've already been reinitialized for THIS stroke — producing
+      // stray angular geometry and a broken/jagged new stroke. Cancelling
+      // the RAF handle is necessary but not sufficient on its own (a
+      // callback can already be queued for this very frame), so every
+      // finish/hold callback also re-checks activeStrokeSessionId against
+      // the token it captured at schedule time before doing anything.
+      if(finishRAF !== null){
+        cancelAnimationFrame(finishRAF);
+        finishRAF = null;
+      }
+      activeStrokeSessionId = ++nextStrokeSessionId;
       const p = screenToCanvas(e.clientX, e.clientY);
       pushUndo();
       beginStrokeCoverage();
@@ -1069,6 +1094,7 @@ try{
       drawVertsIntoAcc(new Float32Array(verts), verts.length / 9, colorRgb, tool === 'eraser');
       if(strokeHoldRAF === null){
         strokeHoldLastT = 0;
+        strokeHoldSession = activeStrokeSessionId;
         strokeHoldRAF = requestAnimationFrame(strokeHoldTick);
       }
     };
@@ -1231,9 +1257,11 @@ try{
     // instead of only catching up once the pen lifts.
     let strokeHoldRAF = null;
     let strokeHoldLastT = 0;
+    let strokeHoldSession = 0;
     function strokeHoldTick(t){
       strokeHoldRAF = null;
       if(!drawing) return;
+      if(strokeHoldSession !== activeStrokeSessionId) return;
       if(pendingStrokeSamples.length){
         flushPendingStrokeSamples();
         strokeHoldLastT = t;
@@ -1469,6 +1497,12 @@ try{
         frames: [] // per-frame trace: position buffer drain, for validation
       };
       let lastTickTime = diag.startTime;
+      // Ownership token for this finish loop — captured once, at the moment
+      // the finish sequence starts, not re-read later. If a new stroke
+      // begins (beginStroke bumps activeStrokeSessionId) before this loop
+      // finishes, every subsequent finishTick call below detects the
+      // mismatch and bails out instead of touching the new stroke's state.
+      const mySession = activeStrokeSessionId;
 
       // ---- Finish playback pacing (position/timing only) -----------------
       // This controls how FAST the already-existing Moving Average buffers
@@ -1537,6 +1571,14 @@ try{
 
       function finishTick(t){
         finishRAF = null;
+        if(mySession !== activeStrokeSessionId){
+          // A newer stroke has already begun (beginStroke both cancelled
+          // this RAF and bumped the session token). This is the belt to
+          // that braces: if we ever get here anyway — e.g. a callback that
+          // was already queued for this exact frame — do NOT touch
+          // lastRaw/lastMid/smoothBuf/etc, they belong to the new stroke now.
+          return;
+        }
         const now = Number.isFinite(t) ? t : performance.now();
         const dt = Math.min(now - lastTickTime, 60);
         lastTickTime = now;
