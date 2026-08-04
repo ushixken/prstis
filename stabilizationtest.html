@@ -136,6 +136,12 @@
     </div>
 
     <div class="group">
+      <label class="small" style="display:flex;align-items:center;gap:4px;cursor:pointer;" title="Diagnostic: stamps isolated dabs at each feedPoint() position instead of drawing connected capsules. 0% stabilization only.">
+        <input type="checkbox" id="dottedBrushToggle" style="cursor:pointer;">Dotted Brush
+      </label>
+    </div>
+
+    <div class="group">
       <button id="undoBtn">↶ Undo</button>
       <button id="redoBtn">↷ Redo</button>
       <button id="clearBtn">🗑 Clear</button>
@@ -189,6 +195,7 @@ try{
   const stabViz = document.getElementById('stabViz');
   const stabVizCtx = stabViz.getContext('2d');
   let leashEnabled = true;
+  let DEBUG_DOTTED_BRUSH = false; // toggled by the "Dotted Brush" checkbox; default unchanged (off)
   const perfEl = document.getElementById('perf');
 
   const W = 1920, H = 1080;
@@ -958,6 +965,143 @@ try{
       if(stabilization <= 0) return 1;
       return Math.max(2, Math.round(stabilization * 100));
     }
+
+    // ==================================================================
+    // EXPERIMENT — uniform spatial resampling of the centerline at 0%
+    // stabilization ("Mode B"), isolated A/B against the current raw
+    // per-event path ("Mode A"). Internal test switch only — NOT a
+    // user-facing control, per spec. Flip RESAMPLE_MODE_B_ENABLED by
+    // hand to compare.
+    //
+    // Krita's "No Smoothing" keeps raw float coordinates but still
+    // paints via accumulated-distance spacing rather than one dab per
+    // input event. We are NOT copying dab-spacing (our renderer already
+    // draws continuous analytic capsules, not discrete dabs) — this
+    // experiment only asks whether feeding feedPoint()/drawQuadCurve()
+    // a geometrically uniform sequence of centerline points, instead of
+    // whatever irregular spacing the pointer happened to report, changes
+    // curve smoothness. The quadratic-curve construction in feedPoint()
+    // itself is completely unmodified; this only changes how many
+    // points, and where along each real segment, get fed into it.
+    //
+    // Only active when stabilization is exactly 0% (movingAverageAmount()
+    // === 1) — identical to the jitter-gate experiment's guard, and for
+    // the same reason: this must never touch the existing stabilization
+    // averaging path.
+    // ==================================================================
+    const RESAMPLE_MODE_B_ENABLED = false; // internal A/B switch — flip to false for Mode A, no UI
+    const RESAMPLE_INTERVAL_SCREEN_PX = 0.5; // named test constant: try 0.25 / 0.5 / 1.0
+
+    // ==================================================================
+    // TEMPORARY DIAGNOSTIC — dotted centerline brush. Internal flag only,
+    // no UI. When true, feedPoint() stamps isolated circular dabs (via the
+    // existing circleVerts()) at the exact float positions it is called
+    // with, instead of calling drawQuadCurve() to connect them. This is
+    // purely a rendering substitution for inspection purposes: it does not
+    // touch stabilization, pressure, resampling, or release behavior, and
+    // it does not change which positions/pressures feedPoint() receives —
+    // only what gets drawn for each one. When false, feedPoint() behaves
+    // exactly as before (drawQuadCurve, unchanged).
+    // ==================================================================
+    // DEBUG_DOTTED_BRUSH itself is declared once at the top-level scope
+    // (outer IIFE), above, so the checkbox handler in the UI-wiring section
+    // near the bottom of the file — outside this WebGPU-engine block — can
+    // mutate the same variable that feedPoint() below reads.
+    const DEBUG_DAB_SPACING_SCREEN_PX = 6;
+    let debugDabDistanceToNext = 0; // canvas-space countdown, carried across feedPoint calls
+
+    function resetDebugDabSpacing(){
+      debugDabDistanceToNext = 0; // recomputed fresh on first segment of the stroke
+    }
+
+    // Walks from (x0,y0) to (x1,y1) — the exact segment feedPoint() was
+    // just given — stamping a circular dab every DEBUG_DAB_SPACING_SCREEN_PX
+    // (converted to canvas/backing units the same way the Mode B resampler
+    // does, so zoom doesn't change the on-screen spacing), then always
+    // stamps the true endpoint (x1,y1) last so it's never withheld. Radius
+    // and alpha are linearly interpolated between r0/a0 (start) and r1/a1
+    // (end) at each dab's position along the segment, using the same
+    // pressureRadius()/pressureAlpha() outputs already computed by
+    // feedPoint() — no new pressure math.
+    function emitDebugDabs(all, x0, y0, x1, y1, r0, r1, a0, a1){
+      const dx = x1 - x0, dy = y1 - y0;
+      const segLen = Math.hypot(dx, dy);
+      const intervalCanvas = (DEBUG_DAB_SPACING_SCREEN_PX * SS) / zoom;
+      if(segLen > 1e-9 && intervalCanvas > 1e-9){
+        const ux = dx / segLen, uy = dy / segLen;
+        let traveled = 0;
+        let distanceToNext = debugDabDistanceToNext > 1e-9 ? debugDabDistanceToNext : intervalCanvas;
+        while(traveled + distanceToNext <= segLen){
+          traveled += distanceToNext;
+          const t = traveled / segLen;
+          const dx_ = x0 + ux * traveled, dy_ = y0 + uy * traveled;
+          const r = r0 + (r1 - r0) * t;
+          const a = a0 + (a1 - a0) * t;
+          const verts = circleVerts(dx_, dy_, r, a);
+          all.push.apply(all, verts);
+          distanceToNext = intervalCanvas;
+        }
+        debugDabDistanceToNext = distanceToNext - (segLen - traveled); // carry remainder forward
+      } else {
+        debugDabDistanceToNext = debugDabDistanceToNext > 1e-9 ? debugDabDistanceToNext : intervalCanvas;
+      }
+      // True endpoint, always, at full float precision — never withheld.
+      const verts = circleVerts(x1, y1, r1, a1);
+      all.push.apply(all, verts);
+    }
+
+    let resampleAnchorPos = null;       // canvas-space, last REAL endpoint already consumed
+    let resampleAnchorPressure = 0;     // real pressure at that endpoint
+    let resampleDistanceToNext = 0;     // canvas-space countdown to the next emission point
+
+    function resetResampler(p, pressure){
+      resampleAnchorPos = p ? { x: p.x, y: p.y } : null;
+      resampleAnchorPressure = pressure;
+      resampleDistanceToNext = 0; // recomputed fresh on first real segment
+    }
+
+    // Marches from the last real endpoint to newPos at a fixed canvas-space
+    // interval (screen-px interval converted so zoom doesn't change it —
+    // req.: "Convert screen-space interval to backing/canvas coordinates").
+    // Always returns the true endpoint last, at full float precision, so
+    // the newest real sample is never withheld waiting on a future event
+    // (req. 6). Leftover sub-interval distance is carried in
+    // resampleDistanceToNext for the next call (req. 2 & 5). Pressure is
+    // linearly interpolated between the two real endpoint pressures for
+    // every generated point (no change to pressure itself elsewhere).
+    function resampleSegment(newPos, newPressure){
+      if(!resampleAnchorPos){
+        resetResampler(newPos, newPressure);
+        resampleDistanceToNext = (RESAMPLE_INTERVAL_SCREEN_PX * SS) / zoom;
+        return [{ pos: newPos, pressure: newPressure }];
+      }
+      const intervalCanvas = (RESAMPLE_INTERVAL_SCREEN_PX * SS) / zoom;
+      const dx = newPos.x - resampleAnchorPos.x, dy = newPos.y - resampleAnchorPos.y;
+      const segLen = Math.hypot(dx, dy);
+      const out = [];
+      if(segLen > 1e-9 && intervalCanvas > 1e-9){
+        const ux = dx / segLen, uy = dy / segLen;
+        let traveled = 0;
+        let distanceToNext = resampleDistanceToNext > 1e-9 ? resampleDistanceToNext : intervalCanvas;
+        while(traveled + distanceToNext <= segLen){
+          traveled += distanceToNext;
+          const t = traveled / segLen; // 0..1 along the REAL segment, for pressure lerp
+          out.push({
+            pos: { x: resampleAnchorPos.x + ux * traveled, y: resampleAnchorPos.y + uy * traveled },
+            pressure: resampleAnchorPressure + (newPressure - resampleAnchorPressure) * t
+          });
+          distanceToNext = intervalCanvas;
+        }
+        resampleDistanceToNext = distanceToNext - (segLen - traveled); // carry remainder forward
+      } else {
+        resampleDistanceToNext = resampleDistanceToNext > 1e-9 ? resampleDistanceToNext : intervalCanvas;
+      }
+      out.push({ pos: newPos, pressure: newPressure }); // exact true endpoint, always
+      resampleAnchorPos = newPos;
+      resampleAnchorPressure = newPressure;
+      return out;
+    }
+
     function pushSmoothBuf(p){
       const maxLen = movingAverageAmount();
       smoothBuf.push({ x: p.x, y: p.y });
@@ -1047,6 +1191,7 @@ try{
       lastRaw = p;
       lastMid = p;
       strokeMoved = false;
+
       __feedPointCallIndex = 0; // reset stroke-start diagnostic counter (see feedPoint)
       const amount = movingAverageAmount();
       // Prefill both buffers to the full moving-average window length at
@@ -1061,6 +1206,8 @@ try{
       smoothBuf = Array.from({ length: amount }, () => ({ x: p.x, y: p.y }));
       lastInputRaw = p;
       const startPressure = effectivePressure(getPressure(e));
+      resetResampler(p, startPressure);
+      resetDebugDabSpacing();
       pressureBuf = Array.from({ length: amount }, () => startPressure);
       delayedPressure = startPressure;
       lastInputPressure = startPressure;
@@ -1139,7 +1286,17 @@ try{
         });
       }
       __feedPointCallIndex++;
-      lastMid = drawQuadCurve(all, midStart, lastRaw, midEnd, startR, r, a, 10);
+      if(DEBUG_DOTTED_BRUSH){
+        // Diagnostic path: stamp isolated dabs along the exact segment just
+        // fed in, instead of drawQuadCurve()'s connected capsule curve.
+        // lastMid/prevRaw/lastRaw bookkeeping below is left identical to
+        // the normal path so nothing downstream (stroke lifecycle, finish,
+        // etc.) sees any difference.
+        emitDebugDabs(all, lastRaw.x, lastRaw.y, raw.x, raw.y, startR, r, lastAlpha == null ? a : lastAlpha, a);
+        lastMid = midEnd;
+      } else {
+        lastMid = drawQuadCurve(all, midStart, lastRaw, midEnd, startR, r, a, 10);
+      }
       lastR = r;
       lastAlpha = a;
       prevRaw = lastRaw;
@@ -1193,6 +1350,35 @@ try{
         if(pressure > CONTACT_PRESSURE_FLOOR) lastContactPressure = pressure;
         delayedPressure = pushPressureBuf(pressure);
         pressureBufferAdvanceCount++;
+        if(RESAMPLE_MODE_B_ENABLED && movingAverageAmount() === 1){
+          // Mode B: uniform spatial resampling. Same per-point pipeline
+          // (pushSmoothBuf -> jump-tessellation check -> feedPoint) as
+          // Mode A below, just run once per generated point instead of
+          // once per raw event.
+          const generated = resampleSegment(inputRaw, delayedPressure);
+          for(const g of generated){
+            const raw = pushSmoothBuf(g.pos);
+            positionBufferAdvanceCount++;
+            const jumpDx = raw.x - lastRaw.x, jumpDy = raw.y - lastRaw.y;
+            const jumpDist = Math.hypot(jumpDx, jumpDy);
+            if(jumpDist > maxStep){
+              const origin = lastRaw;
+              const steps = Math.ceil(jumpDist / maxStep);
+              for(let i = 1; i <= steps; i++){
+                const t = i / steps;
+                feedPoint(all, {
+                  x: origin.x + jumpDx * t,
+                  y: origin.y + jumpDy * t
+                }, g.pressure);
+              }
+            } else {
+              feedPoint(all, raw, g.pressure);
+            }
+          }
+          continue;
+        }
+
+        // Mode A: one point per raw event, unchanged from the original path.
         const raw = pushSmoothBuf(inputRaw);
         positionBufferAdvanceCount++;
         const jumpDx = raw.x - lastRaw.x, jumpDy = raw.y - lastRaw.y;
@@ -2160,6 +2346,9 @@ try{
   const stabVal = document.getElementById('stabVal');
   stabSlider.oninput = (e)=>{ stabilization = (+e.target.value)/100; stabVal.textContent = e.target.value === '0' ? '0 (Off)' : e.target.value; };
   if(!useWebGPU){ stabSlider.disabled = true; stabSlider.title = 'Stabilization requires WebGPU'; }
+
+  const dottedBrushToggle = document.getElementById('dottedBrushToggle');
+  dottedBrushToggle.onchange = (e)=>{ DEBUG_DOTTED_BRUSH = e.target.checked; };
 
   const leashToggle = document.getElementById('leashToggle');
   leashToggle.onchange = (e)=>{
